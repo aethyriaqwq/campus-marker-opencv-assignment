@@ -21,3 +21,8 @@ results/
 *.mp4
 *.mkv
 
+build/
+output/
+*.avi
+*.mp4
+.vscode/
