@@ -1,0 +1,25 @@
+校内赛 MARK 标志物识别 · 杨冉星 · 50032560
+最终复测：2026-10-04，WSL2 Ubuntu 24.04.3 LTS
+
+编译器：GCC 13.3.0
+CMake：3.28.3
+C++ 标准：17
+OpenCV：Ubuntu 系统包 4.6.0；本机已有版本 4.12.0
+
+两套 OpenCV 环境：cmake 配置及构建成功；CTest 2/2 通过。
+回归范围：合成透视、原图坐标还原、双目标、离场即清除、实际视频第 0、619、900 帧。
+
+最终完整视频验证：data/raw/marker_video.avi
+输入：1440x1080，1676 帧，容器帧率约 70.408336 FPS，约 23.804 秒。
+OpenCV 4.6：frames=1676 positive_frames=1086 detections=1086 mean_detection_ms=5.7258
+OpenCV 4.12：frames=1676 positive_frames=1086 detections=1086 mean_detection_ms=5.90756
+注：耗时是检测部分均值，不含视频解码/写入/显示。
+最终 CSV 共 1676 行、每行 17 列；正检测 1086 行、未检测 590 行，无重复帧目标输出。
+MJPG/AVI 演示：1676 帧、1440x1080、约 70.408 FPS，可由 README 命令重现。
+
+连续截图：frame_000000.jpg～frame_000005.jpg、frame_000030.jpg～frame_000039.jpg。
+第 35 帧仍检测到完整四角；第 36 帧画面边界切断图案，立即输出 NOT DETECTED。
+第 619 帧只有一个当前目标输出；第 900 帧为空场景。
+
+以上是程序输出和定性复核，没有人工真值，不作为精确率/召回率声明。
+当前没有摄像头现场输入验证；选做相机标定和 PnP 位姿估计未实现。
