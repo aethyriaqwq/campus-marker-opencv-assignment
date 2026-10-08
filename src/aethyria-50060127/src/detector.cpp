@@ -404,20 +404,20 @@ struct Fit {
   std::array<cv::Point2f, 4> measured{};
   float mouth_ok = 0.f;
   int mouth_in = 0;
-  // Built by moving the previous plate onto this frame's lamps.
+  // Lamps were named from the previous plate, then refit on this frame.
   bool tracked = false;
+  // Four outer edges of this labeling met as one homography.
+  bool from_lines = false;
 };
 
 // A plate edge is the bright arm segments on one drawing line, separated by a dark
-// gap. Perspective keeps those segments colinear, so the visible ones are fit as
-// one line and adjacent lines meet at a corner. The window reaches a drifted
-// centroid seed, and the fit keeps the outer part of the contour. Samples on
-// the image border belong to the clipped mask. A corner with a missing side
-// stays on the centroid model, and an intersection that breaks the convex order
-// is dropped.
+// gap. Lines stay lines under a homography, so four outer edges determine the
+// plate together. Fewer than four leaves the lamp pose untouched: one edge is
+// not allowed to move one corner.
 std::array<cv::Point2f, 4> refine_plate(const cv::Matx33d& h, const std::array<cv::Point2f, 4>& quad,
                                         const std::vector<Blob>& ells, const std::vector<Blob>& pieces,
-                                        const std::vector<Blob>& rims, int cols, int rows) {
+                                        const std::vector<Blob>& rims, int cols, int rows, bool& from_lines) {
+  from_lines = false;
   const float pitch = imaged_pitch(h);
   if (!(pitch > 1.f) || cols < 3 || rows < 3) {
     return quad;
@@ -538,8 +538,6 @@ std::array<cv::Point2f, 4> refine_plate(const cv::Matx33d& h, const std::array<c
     bool ok = false;
     cv::Point2f origin;
     cv::Point2f direction;
-    float lo = 0.f;
-    float hi = 0.f;
     float thickness = 0.f;
   };
   std::array<SideLine, 4> lines{};
@@ -572,31 +570,16 @@ std::array<cv::Point2f, 4> refine_plate(const cv::Matx33d& h, const std::array<c
       line.direction *= -1.f;
     }
     line.thickness = side_thickness[static_cast<size_t>(side)];
-    line.lo = 1e9f;
-    line.hi = -1e9f;
-    for (const cv::Point2f& point : pts) {
-      const float along = point.dot(line.direction);
-      line.lo = std::min(line.lo, along);
-      line.hi = std::max(line.hi, along);
-    }
-    // A fragment that does not follow this edge is not the plate boundary.
-    if (line.direction.dot(direction) < 0.985f) {
+    // Far enough from this edge's direction to be another contour, including at
+    // a steep tilt where the image of the side is no longer parallel to the
+    // lamp-affine edge. About twenty degrees.
+    if (line.direction.dot(direction) < 0.940f) {
       continue;
     }
     line.ok = true;
     lines[static_cast<size_t>(side)] = line;
   }
 
-  auto line_hit = [](const SideLine& first, const SideLine& second, cv::Point2f& hit) {
-    const float cross = first.direction.x * second.direction.y - first.direction.y * second.direction.x;
-    if (std::abs(cross) < 1e-4f) {
-      return false;
-    }
-    const cv::Point2f delta = second.origin - first.origin;
-    const float t = (delta.x * second.direction.y - delta.y * second.direction.x) / cross;
-    hit = first.origin + first.direction * t;
-    return finite_point(hit);
-  };
   auto convex = [](const std::array<cv::Point2f, 4>& corners) {
     for (int i = 0; i < 4; ++i) {
       if (!finite_point(corners[static_cast<size_t>(i)])) {
@@ -610,34 +593,54 @@ std::array<cv::Point2f, 4> refine_plate(const cv::Matx33d& h, const std::array<c
     return true;
   };
 
-  std::array<cv::Point2f, 4> refined = quad;
-  const int meet[4][2] = {{0, 3}, {0, 1}, {2, 1}, {2, 3}};
-  for (int corner = 0; corner < 4; ++corner) {
-    const SideLine& first = lines[static_cast<size_t>(meet[corner][0])];
-    const SideLine& second = lines[static_cast<size_t>(meet[corner][1])];
-    if (!first.ok || !second.ok) {
-      continue;
-    }
-    cv::Point2f hit;
-    if (!line_hit(first, second, hit) ||
-        static_cast<float>(cv::norm(hit - quad[static_cast<size_t>(corner)])) > 0.15f * pitch) {
-      continue;
-    }
-    // Extend a measured edge only by about the bloom, not by a fraction of the plate.
-    const float slack = 0.35f * std::min(first.thickness, second.thickness);
-    const float along_first = hit.dot(first.direction);
-    const float along_second = hit.dot(second.direction);
-    if (along_first < first.lo - slack || along_first > first.hi + slack || along_second < second.lo - slack ||
-        along_second > second.hi + slack) {
-      continue;
-    }
-    const cv::Point2f saved = refined[static_cast<size_t>(corner)];
-    refined[static_cast<size_t>(corner)] = hit;
-    if (!convex(refined)) {
-      refined[static_cast<size_t>(corner)] = saved;
+  int ready = 0;
+  for (const SideLine& line : lines) {
+    if (line.ok) {
+      ++ready;
     }
   }
-  return refined;
+  // Top meets left, top meets right, bottom meets right, bottom meets left.
+  const int meet[4][2] = {{0, 3}, {0, 1}, {2, 1}, {2, 3}};
+  if (ready == 4) {
+    std::array<cv::Point2f, 4> corners{};
+    bool hits = true;
+    for (int corner = 0; corner < 4; ++corner) {
+      const SideLine& first = lines[static_cast<size_t>(meet[corner][0])];
+      const SideLine& second = lines[static_cast<size_t>(meet[corner][1])];
+      const float cross = first.direction.x * second.direction.y - first.direction.y * second.direction.x;
+      if (std::abs(cross) < 1e-4f) {
+        hits = false;
+        break;
+      }
+      const cv::Point2f delta = second.origin - first.origin;
+      const float t = (delta.x * second.direction.y - delta.y * second.direction.x) / cross;
+      const cv::Point2f hit = first.origin + first.direction * t;
+      if (!finite_point(hit) ||
+          static_cast<float>(cv::norm(hit - quad[static_cast<size_t>(corner)])) > 0.25f * pitch) {
+        hits = false;
+        break;
+      }
+      corners[static_cast<size_t>(corner)] = hit;
+    }
+    if (hits && convex(corners)) {
+      const std::vector<cv::Point2f> src = {
+          {kPlateLo, kPlateLo},
+          {kPlateHi, kPlateLo},
+          {kPlateHi, kPlateHi},
+          {kPlateLo, kPlateHi},
+      };
+      const std::vector<cv::Point2f> dst(corners.begin(), corners.end());
+      const cv::Matx33d pose = from_mat(cv::getPerspectiveTransform(src, dst), 3);
+      const float pose_pitch = imaged_pitch(pose);
+      const float linear = static_cast<float>(pose(0, 0) * pose(1, 1) - pose(0, 1) * pose(1, 0));
+      if (finite_h(pose) && linear > 0.f && pose_pitch > 0.75f * pitch && pose_pitch < 1.25f * pitch &&
+          explains_observed(pose, corners, ells)) {
+        from_lines = true;
+        return corners;
+      }
+    }
+  }
+  return quad;
 }
 
 void consider(const cv::Mat& hsv, const cv::Matx33d& h, int support, int v_cut, int s_cut, std::vector<Fit>& passed,
@@ -658,11 +661,15 @@ void consider(const cv::Mat& hsv, const cv::Matx33d& h, int support, int v_cut, 
   }
   Fit fit;
   fit.detection.found = true;
-  // Continuity compares the lamp model. The reported corners are the edge
-  // intersections of the labeling that comparison selects.
-  fit.detection.corners = quad;
-  fit.measured = refine_plate(h, quad, ells, pieces, rims, hsv.cols, hsv.rows);
-  fit.detection.support = support;
+  bool from_lines = false;
+  const std::array<cv::Point2f, 4> measured =
+      refine_plate(h, quad, ells, pieces, rims, hsv.cols, hsv.rows, from_lines);
+  // The kept corners are this frame's pose: the four-edge homography when it
+  // locks, otherwise the lamp affine or similarity with no corner edited alone.
+  fit.detection.corners = measured;
+  fit.measured = measured;
+  fit.from_lines = from_lines;
+  fit.detection.support = from_lines ? 4 : support;
   fit.detection.score = score.recall;
   fit.mouth_ok = score.mouth_ok;
   fit.mouth_in = score.mouth_in;
@@ -699,7 +706,6 @@ bool better_fit(const Fit& a, const Fit& b) {
 struct PlateMemory {
   bool found = false;
   std::array<cv::Point2f, 4> corners{};
-  std::array<cv::Point2f, 4> drawn{};
   cv::Point2f velocity{};
 };
 PlateMemory& plate_memory() {
@@ -726,75 +732,8 @@ bool quad_convex(const std::array<cv::Point2f, 4>& corners) {
   return true;
 }
 
-// Shape is what remains after the median corner step. One spinning corner does
-// not count as motion of the plate.
-float shape_delta(const std::array<cv::Point2f, 4>& previous, const std::array<cv::Point2f, 4>& proposed) {
-  float dx[4];
-  float dy[4];
-  for (int k = 0; k < 4; ++k) {
-    if (!finite_point(proposed[static_cast<size_t>(k)])) {
-      return 1e9f;
-    }
-    dx[k] = proposed[static_cast<size_t>(k)].x - previous[static_cast<size_t>(k)].x;
-    dy[k] = proposed[static_cast<size_t>(k)].y - previous[static_cast<size_t>(k)].y;
-  }
-  const cv::Point2f step(median4(dx[0], dx[1], dx[2], dx[3]), median4(dy[0], dy[1], dy[2], dy[3]));
-  float max_residual = 0.f;
-  for (int k = 0; k < 4; ++k) {
-    max_residual = std::max(max_residual, static_cast<float>(cv::norm(cv::Point2f(dx[k], dy[k]) - step)));
-  }
-  return max_residual;
-}
-
-// The drawn quad follows the measurement, but one frame cannot change its shape
-// by more than about a pixel. The lamp model underneath is not touched.
-std::array<cv::Point2f, 4> limit_shape(const std::array<cv::Point2f, 4>& previous,
-                                      const std::array<cv::Point2f, 4>& proposed) {
-  if (!quad_convex(proposed)) {
-    return previous;
-  }
-  float dx[4];
-  float dy[4];
-  for (int k = 0; k < 4; ++k) {
-    dx[k] = proposed[static_cast<size_t>(k)].x - previous[static_cast<size_t>(k)].x;
-    dy[k] = proposed[static_cast<size_t>(k)].y - previous[static_cast<size_t>(k)].y;
-  }
-  const cv::Point2f step(median4(dx[0], dx[1], dx[2], dx[3]), median4(dy[0], dy[1], dy[2], dy[3]));
-  const float side = std::max(static_cast<float>(cv::norm(previous[1] - previous[0])),
-                              static_cast<float>(cv::norm(previous[3] - previous[0])));
-  const float limit = std::max(0.90f, 0.0045f * std::max(side, 1.f));
-  cv::Point2f residual[4];
-  float max_residual = 0.f;
-  for (int k = 0; k < 4; ++k) {
-    residual[k] = cv::Point2f(dx[k], dy[k]) - step;
-    max_residual = std::max(max_residual, static_cast<float>(cv::norm(residual[k])));
-  }
-  if (max_residual > limit) {
-    const float scale = limit / max_residual;
-    for (cv::Point2f& item : residual) {
-      item *= scale;
-    }
-  }
-  std::array<cv::Point2f, 4> limited{};
-  for (int k = 0; k < 4; ++k) {
-    limited[static_cast<size_t>(k)] = previous[static_cast<size_t>(k)] + step + residual[k];
-  }
-  if (quad_convex(limited)) {
-    return limited;
-  }
-  std::array<cv::Point2f, 4> translated{};
-  for (int k = 0; k < 4; ++k) {
-    translated[static_cast<size_t>(k)] = previous[static_cast<size_t>(k)] + step;
-  }
-  if (quad_convex(translated)) {
-    return translated;
-  }
-  return previous;
-}
-
-// The carried plate is only the fallback for a labeling that jumped. A fresh
-// labeling that still has the same shape is the measurement. An empty frame
-// clears the memory, so a miss is never filled in from the frame before it.
+// Time identifies the lamps. The pose is whatever those lamps measure now.
+// An empty frame clears the memory, so a miss is never filled from the frame before it.
 Detection choose_fit(const std::vector<Fit>& passed) {
   PlateMemory& memory = plate_memory();
   if (passed.empty()) {
@@ -842,14 +781,24 @@ Detection choose_fit(const std::vector<Fit>& passed) {
       fresh = nearest;
     }
   }
-  const Fit* chosen = fresh != nullptr ? fresh : tracked;
-  if (tracked != nullptr && fresh != nullptr && memory.found) {
-    const float side = std::max(static_cast<float>(cv::norm(memory.corners[1] - memory.corners[0])),
-                                static_cast<float>(cv::norm(memory.corners[3] - memory.corners[0])));
-    const float limit = std::max(4.f, 0.02f * std::max(side, 1.f));
-    if (shape_delta(memory.corners, fresh->detection.corners) > limit) {
-      chosen = tracked;
+  // Four edges that meet are a measured homography and outrank a lamp pose that
+  // could not lock them. Among those, the lamps named from the previous frame
+  // win. Nothing here keeps the previous quad as a shape.
+  const Fit* lined = nullptr;
+  for (const Fit& fit : passed) {
+    if (!fit.from_lines) {
+      continue;
     }
+    if (lined == nullptr || (fit.tracked && !lined->tracked) ||
+        (fit.tracked == lined->tracked && better_fit(fit, *lined))) {
+      lined = &fit;
+    }
+  }
+  const Fit* chosen = lined != nullptr ? lined : (tracked != nullptr ? tracked : fresh);
+  if (chosen == nullptr) {
+    memory.found = false;
+    memory.velocity = {};
+    return {};
   }
   cv::Point2f velocity{};
   if (memory.found) {
@@ -861,16 +810,11 @@ Detection choose_fit(const std::vector<Fit>& passed) {
     }
     velocity = {median4(dx[0], dx[1], dx[2], dx[3]), median4(dy[0], dy[1], dy[2], dy[3])};
   }
-  std::array<cv::Point2f, 4> output = chosen->measured;
-  if (memory.found) {
-    output = limit_shape(memory.drawn, chosen->measured);
-  }
   memory.found = true;
-  memory.corners = chosen->detection.corners;
-  memory.drawn = output;
+  memory.corners = chosen->measured;
   memory.velocity = velocity;
   Detection result = chosen->detection;
-  result.corners = output;
+  result.corners = chosen->measured;
   return result;
 }
 
@@ -1352,10 +1296,22 @@ Parts extract_parts(const cv::Mat& hsv) {
       kept.push_back(blob);
     }
   }
+  const float x_hi = static_cast<float>(hsv.cols - 1);
+  const float y_hi = static_cast<float>(hsv.rows - 1);
+  auto cut_by_frame = [&](const Blob& blob) {
+    for (const cv::Point2f& point : blob.edge) {
+      if (point.x <= 0.f || point.y <= 0.f || point.x >= x_hi || point.y >= y_hi) {
+        return true;
+      }
+    }
+    return false;
+  };
   for (const Blob& blob : kept) {
-    if (blob.is_l) {
+    // A contour that meets the image border is not a whole lamp. Its centroid
+    // is not the model centroid, so it can only contribute edge points.
+    if (blob.is_l && !cut_by_frame(blob)) {
       parts.ells.push_back(blob);
-    } else if (blob.is_piece) {
+    } else if (blob.is_piece && !cut_by_frame(blob)) {
       parts.pieces.push_back(blob);
     } else {
       parts.rims.push_back(blob);
@@ -1608,8 +1564,8 @@ bool agrees_with_visible(const cv::Matx33d& pose, int lamp, const Blob& self, co
   return true;
 }
 
-// The previous plate is slid onto the lamps still sitting on it. Its shape stays.
-// A jumped labeling must not rotate or resize the box.
+// Prediction only names the lamps. Two or three named lamps are fit again, so
+// rotation and foreshortening come from this frame. One lamp cannot show a turn.
 void continue_from_previous(const cv::Mat& hsv, const std::vector<Blob>& ells, const std::vector<Blob>& pieces,
                             const std::vector<Blob>& rims, int v_cut, int s_cut, std::vector<Fit>& passed) {
   const PlateMemory& memory = plate_memory();
@@ -1653,23 +1609,41 @@ void continue_from_previous(const cv::Mat& hsv, const std::vector<Blob>& ells, c
   if (count < 1) {
     return;
   }
-  cv::Point2f shift(0.f, 0.f);
+  if (count == 1) {
+    cv::Point2f shift(0.f, 0.f);
+    for (int lamp = 0; lamp < 3; ++lamp) {
+      if (matched[lamp] == nullptr) {
+        continue;
+      }
+      shift = matched[lamp]->centroid - apply(previous, kLamps[lamp].at);
+    }
+    std::array<cv::Point2f, 4> moved{};
+    for (int k = 0; k < 4; ++k) {
+      moved[static_cast<size_t>(k)] = memory.corners[static_cast<size_t>(k)] + shift;
+    }
+    if (!quad_convex(moved)) {
+      return;
+    }
+    const std::vector<cv::Point2f> moved_dst(moved.begin(), moved.end());
+    const cv::Matx33d pose = from_mat(cv::getPerspectiveTransform(src, moved_dst), 3);
+    consider(hsv, pose, 2, v_cut, s_cut, passed, ells, pieces, rims, true);
+    return;
+  }
+  std::vector<cv::Point2f> model;
+  std::vector<cv::Point2f> image;
+  model.reserve(static_cast<size_t>(count));
+  image.reserve(static_cast<size_t>(count));
   for (int lamp = 0; lamp < 3; ++lamp) {
     if (matched[lamp] == nullptr) {
       continue;
     }
-    shift += matched[lamp]->centroid - apply(previous, kLamps[lamp].at);
+    model.push_back(kLamps[lamp].at);
+    image.push_back(matched[lamp]->centroid);
   }
-  shift *= 1.f / static_cast<float>(count);
-  std::array<cv::Point2f, 4> moved{};
-  for (int k = 0; k < 4; ++k) {
-    moved[static_cast<size_t>(k)] = memory.corners[static_cast<size_t>(k)] + shift;
-  }
-  if (!quad_convex(moved)) {
+  const cv::Matx33d pose = count >= 3 ? affine_fit(model, image) : similarity(model[0], model[1], image[0], image[1]);
+  if (!positive_det(pose)) {
     return;
   }
-  const std::vector<cv::Point2f> moved_dst(moved.begin(), moved.end());
-  const cv::Matx33d pose = from_mat(cv::getPerspectiveTransform(src, moved_dst), 3);
   consider(hsv, pose, count >= 3 ? 3 : 2, v_cut, s_cut, passed, ells, pieces, rims, true);
 }
 

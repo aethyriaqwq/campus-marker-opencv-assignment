@@ -27,6 +27,28 @@ cmake --build build/aethyria-50060127 --parallel
 
 ## 运行
 
+在仓库根目录执行。不写 `--output-dir` 和 `--output-video` 时，只在终端打印统计。
+
+```bash
+build/aethyria-50060127/marker_detect --input data/raw/marker_video.avi
+```
+
+| 参数 | 作用 |
+| --- | --- |
+| `--input` | 要读的视频。帧率取容器元数据 |
+| `--output-dir` | 把选中的帧写成 `frame_` 加四位帧号的 PNG。没写 `--save-every` 时每帧都写 |
+| `--save-every` | 正整数间隔，从窗口第一帧算起，第一帧一定保存。必须和 `--output-dir` 一起用 |
+| `--output-video` | 把选中的每一帧写成标注视频，编码 `avc1`，帧率取容器元数据。可以和 PNG 同时写 |
+| `--from` | 闭区间起点，默认 0。更早的帧只为接上跨帧记录而检测，不打印、不保存、不计入汇总 |
+| `--to` | 闭区间终点。省略则读到视频结束。读完这一帧就停 |
+| `--calibrate` | 用 `--input` 估计内参 |
+| `--camera` | 标定结果路径，默认 `src/aethyria-50060127/camera.yaml`。只和 `--calibrate` 一起用，检测不读它 |
+| `--help` | 打印用法 |
+
+检测命令写了 `--camera`，或标定命令写了输出、间隔、窗口，都会失败。`--save-every` 小于 1、帧号为负、`--to` 早于 `--from`，同样失败。
+
+每隔 20 帧存一张：
+
 ```bash
 build/aethyria-50060127/marker_detect \
   --input data/raw/marker_video.avi \
@@ -34,18 +56,9 @@ build/aethyria-50060127/marker_detect \
   --save-every 20
 ```
 
-| 参数 | 作用 |
-| --- | --- |
-| `--input` | 视频路径。帧率用容器元数据，程序里不写死 |
-| `--from`、`--to` | 闭区间帧号，只统计和保存这一段。`--from` 之前的帧仍会检测，用来接上跨帧记录，但不打印、不保存。`--to` 之后的帧只解码 |
-| `--output-dir` | 保存画了结果的 PNG。文件名是 `frame_` 加四位帧号 |
-| `--save-every` | 每隔多少帧保存一张。`0` 表示只在终端打印统计 |
-| `--output-video` | 把统计区间里的每一帧写成标注视频。帧率用容器元数据，编码是 `avc1`。不写这个参数就不生成视频 |
-| `--calibrate` | 用标定视频估计内参，写到 `--camera`。默认 `src/aethyria-50060127/camera.yaml` |
+终端按连续段打印 `detected 起-止 support N` 或 `undetected 起-止`。支持数是这一帧怎么定出板面：4 是四条外缘共同确定的单应；3 是三只完整实心灯质心的仿射；2 是两只灯的相似，或只剩一只灯时沿用上一帧的朝向并平移；1 是单灯。上一帧只用来把灯对上号。两只或三只对上的灯用这一帧的质心重新拟合。四条外缘都量到时，用它们的交点换成一个单应，这条结果优先于没有锁住外缘的灯姿态。贴到图像边界的轮廓不提供质心。汇总行里的 `homography`、`affine`、`similarity`、`single` 依次对应支持数 4、3、2、1。
 
-终端按连续段打印 `detected 起-止 support N` 或 `undetected 起-止`。支持数是这一帧怎么定出板面：3 是三只实心灯质心的仿射，或把上一块板平移到仍对得上的至少三只灯；2 是两只灯的相似，或上一块板只对上一到两只灯；1 是单灯。汇总行里的 `homography`、`affine`、`similarity`、`single` 依次对应支持数 4、3、2、1。这一版不用支持数 4，所以 `homography` 是 0。
-
-画出的四边形跟着这一帧的外缘交点走。整板平移不限制；去掉平移之后，形状每帧大约只变 1 像素。这个限制只作用在画面上，下一帧的灯质心模型仍用没限制过的板。没有假设通过时不画上一帧的框。
+画出的四边形就是这一帧留下的那个姿态。没有假设通过时不画上一帧的框。
 
 测试视频是 `data/raw/marker_video.avi`：1440×1080，1676 帧，约 23.8 秒。本机从容器读到的帧率是 70.4083。这台机器的 Release 构建可以在半分钟内跑完。实心 L 的模板只光栅化一次，之后每条轮廓用位图重叠来打分。
 
@@ -59,12 +72,12 @@ build/aethyria-50060127/marker_detect \
 build/aethyria-50060127/marker_detect \
   --input data/raw/marker_video.avi \
   --output-dir src/aethyria-50060127/frames/right-exit \
-  --from 0 --to 60 --save-every 1
+  --from 0 --to 60
 
 build/aethyria-50060127/marker_detect \
   --input data/raw/marker_video.avi \
   --output-dir src/aethyria-50060127/frames/left-exit \
-  --from 852 --to 876 --save-every 1
+  --from 852 --to 876
 ```
 
 - `frames/right-exit/`：第 0 帧到第 60 帧。开头是整块灯板，接着从右侧出画，灯被切成条之后变为未检出。

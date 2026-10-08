@@ -17,28 +17,40 @@ struct Options {
   std::string output;
   std::string video;
   std::string camera = "src/aethyria-50060127/camera.yaml";
-  int save_every = 0;
+  int save_every = 1;
   int from = 0;
+  // Negative means the window runs through the last frame. The command line
+  // itself does not accept a negative index; this is only the omitted --to.
   int to = -1;
   bool calibrate = false;
+  bool output_set = false;
+  bool video_set = false;
+  bool save_every_set = false;
+  bool from_set = false;
+  bool to_set = false;
+  bool camera_set = false;
 };
 
-void usage() {
-  std::cerr << "usage: marker_detect --input <video> [--output-dir <dir>] [--save-every <n>]\n"
-               "                      [--output-video <file>] [--from <frame>] [--to <frame>]\n"
-               "       marker_detect --calibrate --input <video> [--camera <yaml>]\n"
-               "example:\n"
-               "  marker_detect --input data/raw/marker_video.avi \\\n"
-               "      --output-dir output/aethyria-50060127/frames --save-every 20\n"
-               "  marker_detect --input data/raw/marker_video.avi \\\n"
-               "      --output-video output/aethyria-50060127/annotated.mp4\n";
+void usage(std::ostream& out) {
+  out << "usage: marker_detect --input <video> [--output-dir <dir>] [--save-every <n>]\n"
+         "                      [--output-video <file>] [--from <frame>] [--to <frame>]\n"
+         "       marker_detect --calibrate --input <video> [--camera <yaml>]\n"
+         "       marker_detect --help\n"
+         "\n"
+         "--output-dir writes frame_NNNN.png. Omit --save-every to write every selected frame.\n"
+         "--save-every is a positive interval and requires --output-dir. The first selected frame is written.\n"
+         "--output-video writes every selected frame as avc1 at the container frame rate.\n"
+         "--from is inclusive, default 0. Earlier frames are detected only to keep the track.\n"
+         "--to is inclusive. Omit it to read through the end. Reading stops after this frame.\n"
+         "--camera defaults to src/aethyria-50060127/camera.yaml and is valid only with --calibrate.\n";
 }
 
-bool parse(int argc, char** argv, Options& options) {
+bool parse(int argc, char** argv, Options& options, std::string& error) {
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
     auto need = [&](std::string& out) {
-      if (i + 1 >= argc) {
+      if (i + 1 >= argc || std::string(argv[i + 1]).empty()) {
+        error = "missing value for " + arg;
         return false;
       }
       out = argv[++i];
@@ -50,8 +62,15 @@ bool parse(int argc, char** argv, Options& options) {
         return false;
       }
       try {
-        out = std::stoi(text);
+        std::size_t used = 0;
+        const int value = std::stoi(text, &used);
+        if (used != text.size()) {
+          error = "not an integer: " + text;
+          return false;
+        }
+        out = value;
       } catch (const std::exception&) {
+        error = "not an integer: " + text;
         return false;
       }
       return true;
@@ -64,41 +83,94 @@ bool parse(int argc, char** argv, Options& options) {
       if (!need(options.output)) {
         return false;
       }
+      options.output_set = true;
     } else if (arg == "--save-every") {
       if (!need_int(options.save_every)) {
         return false;
       }
+      options.save_every_set = true;
     } else if (arg == "--output-video") {
       if (!need(options.video)) {
         return false;
       }
+      options.video_set = true;
     } else if (arg == "--from") {
       if (!need_int(options.from)) {
         return false;
       }
+      options.from_set = true;
     } else if (arg == "--to") {
       if (!need_int(options.to)) {
         return false;
       }
+      options.to_set = true;
     } else if (arg == "--calibrate") {
       options.calibrate = true;
     } else if (arg == "--camera") {
       if (!need(options.camera)) {
         return false;
       }
+      options.camera_set = true;
     } else {
+      error = "unknown option " + arg;
       return false;
     }
   }
-  return !options.input.empty() && options.save_every >= 0 && options.from >= 0;
+  if (options.input.empty()) {
+    error = "missing --input";
+    return false;
+  }
+  if (options.calibrate) {
+    if (options.output_set || options.save_every_set || options.video_set || options.from_set || options.to_set) {
+      error = "--calibrate only accepts --input and --camera";
+      return false;
+    }
+    return true;
+  }
+  if (options.camera_set) {
+    error = "--camera is only used with --calibrate";
+    return false;
+  }
+  if (options.save_every_set && !options.output_set) {
+    error = "--save-every requires --output-dir";
+    return false;
+  }
+  if (options.save_every_set && options.save_every < 1) {
+    error = "--save-every must be a positive integer";
+    return false;
+  }
+  if (options.from < 0) {
+    error = "--from must be a frame index >= 0";
+    return false;
+  }
+  if (options.to_set && options.to < 0) {
+    error = "--to must be a frame index >= 0";
+    return false;
+  }
+  if (options.to_set && options.to < options.from) {
+    error = "--to is before --from";
+    return false;
+  }
+  return true;
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
+  for (int i = 1; i < argc; ++i) {
+    const std::string arg = argv[i];
+    if (arg == "--help" || arg == "-h") {
+      usage(std::cout);
+      return 0;
+    }
+  }
   Options options;
-  if (!parse(argc, argv, options)) {
-    usage();
+  std::string error;
+  if (!parse(argc, argv, options, error)) {
+    if (!error.empty()) {
+      std::cerr << error << "\n";
+    }
+    usage(std::cerr);
     return 2;
   }
   if (options.calibrate) {
@@ -138,16 +210,13 @@ int main(int argc, char** argv) {
     }
     std::cout << "\n";
   };
-  while (capture.read(frame)) {
-    const bool selected = index >= options.from && (options.to < 0 || index <= options.to);
+  while (options.to < 0 || index <= options.to) {
+    if (!capture.read(frame)) {
+      break;
+    }
     if (index < options.from) {
       // Keep the carried plate, but do not count or save frames before the window.
       detect_marker(frame);
-    } else if (!selected) {
-      if (run_start >= 0) {
-        close_run(index - 1);
-        run_start = -1;
-      }
     } else {
       Detection detection = detect_marker(frame);
       ++frames;
@@ -205,6 +274,10 @@ int main(int argc, char** argv) {
   if (run_start >= 0) {
     close_run(index - 1);
   }
+  if (frames == 0) {
+    std::cerr << "no frames in range\n";
+    return 1;
+  }
   std::cout << "frames " << frames << "\n"
             << "detected " << found << "\n"
             << "homography " << by_support[4] << "\n"
@@ -213,5 +286,5 @@ int main(int argc, char** argv) {
             << "single " << by_support[1] << "\n"
             << "undetected " << (frames - found) << "\n"
             << "longest_miss " << max_miss << "\n";
-  return frames == 0 ? 1 : 0;
+  return 0;
 }
