@@ -1,0 +1,22 @@
+%YAML:1.0
+---
+image_width: 1440
+image_height: 1080
+camera_matrix: !!opencv-matrix
+   rows: 3
+   cols: 3
+   dt: d
+   data: [ 2.3908474910498148e+03, 0., 7.0574926338223338e+02, 0.,
+       2.3911147208538450e+03, 5.6382865642588217e+02, 0., 0., 1. ]
+distortion_coefficients: !!opencv-matrix
+   rows: 1
+   cols: 5
+   dt: d
+   data: [ -6.8609825818452500e-02, 3.3232769790617139e-01,
+       -5.0406613446458233e-04, -8.5915278434982117e-04, 0. ]
+rms: 8.3561698127653253e-02
+views: 270
+pattern_cols: 7
+pattern_rows: 7
+object_unit: circle-center spacing
+board_label: HC300-15-7x7
