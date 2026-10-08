@@ -40,6 +40,7 @@ build/aethyria-50060127/marker_detect \
 | `--from`、`--to` | 闭区间帧号，只统计和保存这一段。`--from` 之前的帧仍会检测，用来接上跨帧记录，但不打印、不保存。`--to` 之后的帧只解码 |
 | `--output-dir` | 保存画了结果的 PNG。文件名是 `frame_` 加四位帧号 |
 | `--save-every` | 每隔多少帧保存一张。`0` 表示只在终端打印统计 |
+| `--output-video` | 把统计区间里的每一帧写成标注视频。帧率用容器元数据，编码是 `avc1`。不写这个参数就不生成视频 |
 | `--calibrate` | 用标定视频估计内参，写到 `--camera`。默认 `src/aethyria-50060127/camera.yaml` |
 
 终端按连续段打印 `detected 起-止 support N` 或 `undetected 起-止`。支持数是这一帧怎么定出板面：3 是三只实心灯质心的仿射，或把上一块板平移到仍对得上的至少三只灯；2 是两只灯的相似，或上一块板只对上一到两只灯；1 是单灯。汇总行里的 `homography`、`affine`、`similarity`、`single` 依次对应支持数 4、3、2、1。这一版不用支持数 4，所以 `homography` 是 0。
@@ -69,7 +70,15 @@ build/aethyria-50060127/marker_detect \
 - `frames/right-exit/`：第 0 帧到第 60 帧。开头是整块灯板，接着从右侧出画，灯被切成条之后变为未检出。
 - `frames/left-exit/`：第 852 帧到第 876 帧。灯板从左侧离开，右侧灯还在时框延伸到画面外，贴边之后变为未检出。`--from` 之前的帧已经把跨帧记录接上，所以这 25 张和从第 0 帧连续跑到这里相同。
 
-全片统计和参数写在 `REPORT.md`。仓库忽略 `*.mp4`，这里不附视频。
+整段标注视频可以写到仓库忽略的 `output/`：
+
+```bash
+build/aethyria-50060127/marker_detect \
+  --input data/raw/marker_video.avi \
+  --output-video output/aethyria-50060127/annotated.mp4
+```
+
+全片统计和参数写在 `REPORT.md`。仓库忽略 `*.mp4`，提交里仍然是上面的连续帧。
 
 ## 画面上的角点
 

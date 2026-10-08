@@ -15,6 +15,7 @@ namespace {
 struct Options {
   std::string input;
   std::string output;
+  std::string video;
   std::string camera = "src/aethyria-50060127/camera.yaml";
   int save_every = 0;
   int from = 0;
@@ -24,11 +25,13 @@ struct Options {
 
 void usage() {
   std::cerr << "usage: marker_detect --input <video> [--output-dir <dir>] [--save-every <n>]\n"
-               "                      [--from <frame>] [--to <frame>]\n"
+               "                      [--output-video <file>] [--from <frame>] [--to <frame>]\n"
                "       marker_detect --calibrate --input <video> [--camera <yaml>]\n"
                "example:\n"
                "  marker_detect --input data/raw/marker_video.avi \\\n"
-               "      --output-dir output/aethyria-50060127/frames --save-every 20\n";
+               "      --output-dir output/aethyria-50060127/frames --save-every 20\n"
+               "  marker_detect --input data/raw/marker_video.avi \\\n"
+               "      --output-video output/aethyria-50060127/annotated.mp4\n";
 }
 
 bool parse(int argc, char** argv, Options& options) {
@@ -63,6 +66,10 @@ bool parse(int argc, char** argv, Options& options) {
       }
     } else if (arg == "--save-every") {
       if (!need_int(options.save_every)) {
+        return false;
+      }
+    } else if (arg == "--output-video") {
+      if (!need(options.video)) {
         return false;
       }
     } else if (arg == "--from") {
@@ -105,6 +112,13 @@ int main(int argc, char** argv) {
   if (!options.output.empty()) {
     std::filesystem::create_directories(options.output);
   }
+  if (!options.video.empty()) {
+    const std::filesystem::path video_path(options.video);
+    if (video_path.has_parent_path()) {
+      std::filesystem::create_directories(video_path.parent_path());
+    }
+  }
+  cv::VideoWriter writer;
   int frames = 0;
   int found = 0;
   int by_support[5] = {};
@@ -158,14 +172,32 @@ int main(int argc, char** argv) {
       }
       const bool save = !options.output.empty() && options.save_every > 0 &&
                         ((index - options.from) % options.save_every == 0);
-      if (save) {
+      if (save || !options.video.empty()) {
         draw_detection(frame, detection);
+      }
+      if (save) {
         std::ostringstream path;
         path << options.output << "/frame_" << std::setw(4) << std::setfill('0') << index << ".png";
         if (!cv::imwrite(path.str(), frame)) {
           std::cerr << "cannot write " << path.str() << "\n";
           return 1;
         }
+      }
+      if (!options.video.empty()) {
+        if (!writer.isOpened()) {
+          const double fps = capture.get(cv::CAP_PROP_FPS);
+          if (!(fps > 0.0)) {
+            std::cerr << "input has no frame rate\n";
+            return 1;
+          }
+          writer.open(options.video, cv::CAP_FFMPEG, cv::VideoWriter::fourcc('a', 'v', 'c', '1'), fps,
+                      frame.size());
+          if (!writer.isOpened()) {
+            std::cerr << "cannot open " << options.video << "\n";
+            return 1;
+          }
+        }
+        writer.write(frame);
       }
     }
     ++index;
