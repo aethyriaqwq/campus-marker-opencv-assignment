@@ -3,6 +3,7 @@
 
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/videoio.hpp>
+#include <opencv2/core.hpp>
 
 #include <filesystem>
 #include <iomanip>
@@ -17,6 +18,8 @@ struct Options {
   std::string output;
   std::string video;
   std::string camera = "src/aethyria-50060127/camera.yaml";
+  std::string model = "src/aethyria-50060127/marker.yaml";
+  std::string params = "src/aethyria-50060127/detector.yaml";
   int save_every = 1;
   int from = 0;
   // Negative means the window runs through the last frame. The command line
@@ -29,6 +32,8 @@ struct Options {
   bool from_set = false;
   bool to_set = false;
   bool camera_set = false;
+  bool model_set = false;
+  bool params_set = false;
 };
 
 void usage(std::ostream& out) {
@@ -42,7 +47,8 @@ void usage(std::ostream& out) {
          "--output-video writes every selected frame as avc1 at the container frame rate.\n"
          "--from is inclusive, default 0. Earlier frames are detected only to keep the track.\n"
          "--to is inclusive. Omit it to read through the end. Reading stops after this frame.\n"
-         "--camera defaults to src/aethyria-50060127/camera.yaml and is valid only with --calibrate.\n";
+         "--camera is the calibration yaml. Detection reads it. The default is src/aethyria-50060127/camera.yaml.\n"
+         "--model is the marker geometry. --params is the estimator. Tuning either file does not change the program.\n";
 }
 
 bool parse(int argc, char** argv, Options& options, std::string& error) {
@@ -111,6 +117,16 @@ bool parse(int argc, char** argv, Options& options, std::string& error) {
         return false;
       }
       options.camera_set = true;
+    } else if (arg == "--model") {
+      if (!need(options.model)) {
+        return false;
+      }
+      options.model_set = true;
+    } else if (arg == "--params") {
+      if (!need(options.params)) {
+        return false;
+      }
+      options.params_set = true;
     } else {
       error = "unknown option " + arg;
       return false;
@@ -121,15 +137,12 @@ bool parse(int argc, char** argv, Options& options, std::string& error) {
     return false;
   }
   if (options.calibrate) {
-    if (options.output_set || options.save_every_set || options.video_set || options.from_set || options.to_set) {
+    if (options.output_set || options.save_every_set || options.video_set || options.from_set || options.to_set ||
+        options.model_set || options.params_set) {
       error = "--calibrate only accepts --input and --camera";
       return false;
     }
     return true;
-  }
-  if (options.camera_set) {
-    error = "--camera is only used with --calibrate";
-    return false;
   }
   if (options.save_every_set && !options.output_set) {
     error = "--save-every requires --output-dir";
@@ -176,6 +189,24 @@ int main(int argc, char** argv) {
   if (options.calibrate) {
     return calibrate_camera(options.input, options.camera) ? 0 : 1;
   }
+  cv::FileStorage intrinsics(options.camera, cv::FileStorage::READ);
+  if (!intrinsics.isOpened()) {
+    std::cerr << "cannot open " << options.camera << "\n";
+    return 1;
+  }
+  cv::Mat camera;
+  cv::Mat dist;
+  intrinsics["camera_matrix"] >> camera;
+  intrinsics["distortion_coefficients"] >> dist;
+  if (camera.rows != 3 || camera.cols != 3) {
+    std::cerr << "camera_matrix missing in " << options.camera << "\n";
+    return 1;
+  }
+  MarkerDetector detector;
+  if (!detector.load(options.model, options.params, camera, dist, error)) {
+    std::cerr << error << "\n";
+    return 1;
+  }
   cv::VideoCapture capture(options.input);
   if (!capture.isOpened()) {
     std::cerr << "cannot open " << options.input << "\n";
@@ -216,9 +247,9 @@ int main(int argc, char** argv) {
     }
     if (index < options.from) {
       // Keep the carried plate, but do not count or save frames before the window.
-      detect_marker(frame);
+      detector.detect(frame);
     } else {
-      Detection detection = detect_marker(frame);
+      Detection detection = detector.detect(frame);
       ++frames;
       const int support = detection.found ? detection.support : 0;
       if (run_start < 0) {
@@ -280,10 +311,10 @@ int main(int argc, char** argv) {
   }
   std::cout << "frames " << frames << "\n"
             << "detected " << found << "\n"
-            << "homography " << by_support[4] << "\n"
-            << "affine " << by_support[3] << "\n"
-            << "similarity " << by_support[2] << "\n"
-            << "single " << by_support[1] << "\n"
+            << "measured4 " << by_support[4] << "\n"
+            << "measured3 " << by_support[3] << "\n"
+            << "measured2 " << by_support[2] << "\n"
+            << "measured1 " << by_support[1] << "\n"
             << "undetected " << (frames - found) << "\n"
             << "longest_miss " << max_miss << "\n";
   return 0;

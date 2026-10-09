@@ -1,0 +1,40 @@
+%YAML:1.0
+---
+# Estimator settings. Distances that belong to the marker are in drawing
+# units. Ratios are dimensionless. Pixel values are sensor noise, not a
+# size measured on one video.
+levels: [32, 64, 96, 128, 160, 192, 224]
+segment_scale: 1
+approx_frac: 0.02
+min_area: 16
+dedup_px: 4
+max_polygons: 40
+reproj_frac: 0.1
+lit_ratio: 0.45
+unlit_ratio: 0.25
+min_contrast: 12
+run_margin: 2
+min_samples: 3
+agree_frac: 0.7
+min_confirmed_runs: 2
+pose_agree_frac: 0.06
+# A second locked pose is a different plate only when its mean edge cost
+# is within this multiple of the best one. A much worse minimum is not
+# an alternative reading of the border.
+rival_cost_ratio: 2
+# How many frame-widths the normal search may walk. The inner edge of the
+# arm is one frame inward and has the opposite contrast, so the sign rejects
+# it. The window is one frame: far enough to follow the outer edge, and it
+# stops at the marker's own stroke.
+search_widths: 1
+min_search_px: 2
+sample_step: 2
+lm_iters: 8
+huber_px: 2
+# Fraction of the on-screen samples of one side that must find the outer edge.
+min_edge_frac: 0.45
+min_edge_samples: 20
+# Inliers must span this fraction of the outer side before that side counts
+# as a line. A shorter piece leaves the far corner free, and the published
+# square then changes size as the visible sliver grows.
+min_side_span: 0.5

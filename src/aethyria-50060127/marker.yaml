@@ -1,0 +1,12 @@
+%YAML:1.0
+---
+# Square frame. All four corners are L shapes of the same arm length.
+# notch_corner is the notched L: from the outer corner along each arm,
+# bright [0, notch_bright), dark notch_gap, then bright through arm.
+# 0 LT, 1 RT, 2 RB, 3 LB. Units are the drawing units of figure 5-8.
+outer: 80
+frame: 8
+arm: 30
+notch_bright: 14
+notch_gap: 8
+notch_corner: 1

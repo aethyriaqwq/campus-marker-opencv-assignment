@@ -4,1792 +4,1062 @@
 #include <opencv2/imgproc.hpp>
 
 #include <algorithm>
-#include <array>
-#include <cstdint>
 #include <cmath>
-#include <vector>
+#include <limits>
+#include <map>
+#include <utility>
 
 namespace {
 
-// Labeled drawing sizes, in drawing units. The plate is 80, each corner cell is 30,
-// and the arm inner edge is 22, so the arm is 8 thick. One model unit is the distance
-// between adjacent solid-L centroids. A solid L of outer 30 and thickness 8 has area
-// 416, and its centroid moment about the outer corner is 4304.
-constexpr int kOuter = 80;
-constexpr int kCell = 30;
-constexpr int kArm = 8;
-constexpr int kArea = kArm * (2 * kCell - kArm);
-constexpr float kCx = 4304.f / static_cast<float>(kArea);
-constexpr float kPitch = static_cast<float>(kOuter) - 2.f * kCx;
-constexpr float kPlateLo = (0.f - kCx) / kPitch;
-constexpr float kPlateHi = (static_cast<float>(kOuter) - kCx) / kPitch;
-constexpr float kLSide = static_cast<float>(kCell) / kPitch;
+cv::Mat column(const cv::Vec3d& v) {
+  return (cv::Mat_<double>(3, 1) << v[0], v[1], v[2]);
+}
 
-// Detail A is that same L with two bites of width 8. The connected corner reaches 14;
-// each arm keeps an 8-square from 22 to 30. The corner centroid lies on the diagonal
-// of its own box. When no solid lamp verifies, the corner and one end fix a similarity,
-// and the other end can tighten that similarity to an affine.
-constexpr int kCornerOuter = 14;
-constexpr float kCornerArea = static_cast<float>(kArm * (2 * kCornerOuter - kArm));
-constexpr float kEndArea = static_cast<float>(kArm * kArm);
-
-struct LampId {
-  cv::Point2f at;
-  cv::Point2f elbow;
-};
-
-const LampId kLamps[3] = {
-    {{0.f, 0.f}, {-0.70710678f, -0.70710678f}},
-    {{0.f, 1.f}, {-0.70710678f, 0.70710678f}},
-    {{1.f, 1.f}, {0.70710678f, 0.70710678f}},
-};
-
-cv::Point2f to_model(float x, float y) { return {(x - kCx) / kPitch, (y - kCx) / kPitch}; }
-
-cv::Point2f drawing_center(const cv::Point2f* pts, int n) {
-  double twice = 0.0;
-  double sx = 0.0;
-  double sy = 0.0;
-  for (int i = 0; i < n; ++i) {
-    const cv::Point2f& a = pts[i];
-    const cv::Point2f& b = pts[(i + 1) % n];
-    const double cross = static_cast<double>(a.x) * b.y - static_cast<double>(b.x) * a.y;
-    twice += cross;
-    sx += (static_cast<double>(a.x) + b.x) * cross;
-    sy += (static_cast<double>(a.y) + b.y) * cross;
+cv::Point2d rotate90(cv::Point2d p, double center, int turns) {
+  double x = p.x - center;
+  double y = p.y - center;
+  for (int i = 0; i < turns; ++i) {
+    const double nx = -y;
+    const double ny = x;
+    x = nx;
+    y = ny;
   }
-  return {static_cast<float>(sx / (3.0 * twice)), static_cast<float>(sy / (3.0 * twice))};
+  return {x + center, y + center};
 }
 
-cv::Point2f drawing_centroid(const cv::Point2f* pts, int n) {
-  const cv::Point2f center = drawing_center(pts, n);
-  return to_model(center.x, center.y);
-}
-
-struct PieceModel {
-  cv::Point2f at;
-  float area;
-  cv::Point2f elbow;
-};
-
-const std::array<PieceModel, 3>& piece_models() {
-  static const std::array<PieceModel, 3> models = [] {
-    const cv::Point2f corner[] = {{80.f, 0.f}, {66.f, 0.f}, {66.f, 8.f}, {72.f, 8.f}, {72.f, 14.f}, {80.f, 14.f}};
-    const cv::Point2f top[] = {{50.f, 0.f}, {58.f, 0.f}, {58.f, 8.f}, {50.f, 8.f}};
-    const cv::Point2f side[] = {{72.f, 22.f}, {80.f, 22.f}, {80.f, 30.f}, {72.f, 30.f}};
-    const cv::Point2f center = drawing_center(corner, 6);
-    float min_x = corner[0].x;
-    float max_x = corner[0].x;
-    float min_y = corner[0].y;
-    float max_y = corner[0].y;
-    for (const cv::Point2f& point : corner) {
-      min_x = std::min(min_x, point.x);
-      max_x = std::max(max_x, point.x);
-      min_y = std::min(min_y, point.y);
-      max_y = std::max(max_y, point.y);
-    }
-    cv::Point2f elbow = center - cv::Point2f(0.5f * (min_x + max_x), 0.5f * (min_y + max_y));
-    const float norm = std::hypot(elbow.x, elbow.y);
-    elbow *= 1.f / norm;
-    return std::array<PieceModel, 3>{
-        PieceModel{drawing_centroid(corner, 6), kCornerArea, elbow},
-        PieceModel{drawing_centroid(top, 4), kEndArea, {0.f, 0.f}},
-        PieceModel{drawing_centroid(side, 4), kEndArea, {0.f, 0.f}},
-    };
-  }();
-  return models;
-}
-
-struct Poly {
-  cv::Point2f pts[6];
-  int n;
-};
-
-const Poly kLampPolys[] = {
-    {{{0.f, 0.f}, {30.f, 0.f}, {30.f, 8.f}, {8.f, 8.f}, {8.f, 30.f}, {0.f, 30.f}}, 6},
-    {{{0.f, 80.f}, {30.f, 80.f}, {30.f, 72.f}, {8.f, 72.f}, {8.f, 50.f}, {0.f, 50.f}}, 6},
-    {{{80.f, 80.f}, {80.f, 50.f}, {72.f, 50.f}, {72.f, 72.f}, {50.f, 72.f}, {50.f, 80.f}}, 6},
-    {{{80.f, 0.f}, {66.f, 0.f}, {66.f, 8.f}, {72.f, 8.f}, {72.f, 14.f}, {80.f, 14.f}}, 6},
-    {{{50.f, 0.f}, {58.f, 0.f}, {58.f, 8.f}, {50.f, 8.f}}, 4},
-    {{{72.f, 22.f}, {80.f, 22.f}, {80.f, 30.f}, {72.f, 30.f}}, 4},
-};
-
-bool inside_poly(const cv::Point2f* pts, int n, float x, float y) {
-  bool crossing = false;
-  for (int i = 0, j = n - 1; i < n; j = i++) {
-    const float yi = pts[i].y;
-    const float yj = pts[j].y;
-    if ((yi > y) != (yj > y) && (x < (pts[j].x - pts[i].x) * (y - yi) / (yj - yi) + pts[i].x)) {
-      crossing = !crossing;
-    }
-  }
-  return crossing;
-}
-
-const std::vector<cv::Point2f>& lamp_samples() {
-  static const std::vector<cv::Point2f> samples = [] {
-    std::vector<cv::Point2f> out;
-    for (int y = 1; y < kOuter; y += 2) {
-      for (int x = 1; x < kOuter; x += 2) {
-        for (const Poly& poly : kLampPolys) {
-          if (inside_poly(poly.pts, poly.n, static_cast<float>(x), static_cast<float>(y))) {
-            out.push_back(to_model(static_cast<float>(x), static_cast<float>(y)));
-            break;
-          }
-        }
-      }
-    }
-    return out;
-  }();
-  return samples;
-}
-
-// The plate center is dark for every 90° labeling. The two mouths belong only to the
-// gapped corner, so they are scored on their own.
-struct DarkSets {
-  std::vector<cv::Point2f> center;
-  std::vector<cv::Point2f> mouths;
-};
-
-const DarkSets& dark_sets() {
-  static const DarkSets sets = [] {
-    DarkSets built;
-    auto add_rect = [&](std::vector<cv::Point2f>& out, int x0, int y0, int x1, int y1) {
-      for (int y = y0; y < y1; y += 2) {
-        for (int x = x0; x < x1; x += 2) {
-          out.push_back(to_model(static_cast<float>(x), static_cast<float>(y)));
-        }
-      }
-    };
-    add_rect(built.center, 31, 31, 50, 50);
-    add_rect(built.mouths, 59, 1, 66, 8);
-    add_rect(built.mouths, 73, 15, 80, 22);
-    return built;
-  }();
-  return sets;
-}
-
-cv::Point2f apply(const cv::Matx33d& h, cv::Point2f p) {
-  const cv::Vec3d q = h * cv::Vec3d(p.x, p.y, 1.0);
-  return cv::Point2f(static_cast<float>(q[0] / q[2]), static_cast<float>(q[1] / q[2]));
-}
-
-bool finite_point(cv::Point2f p) { return std::isfinite(p.x) && std::isfinite(p.y); }
-
-bool finite_h(const cv::Matx33d& h) {
-  for (int i = 0; i < 9; ++i) {
-    if (!std::isfinite(h.val[i])) {
-      return false;
-    }
-  }
-  return true;
-}
-
-cv::Matx33d from_mat(const cv::Mat& m, int rows) {
-  cv::Matx33d h = cv::Matx33d::eye();
-  for (int r = 0; r < rows; ++r) {
-    for (int c = 0; c < m.cols; ++c) {
-      h(r, c) = m.at<double>(r, c);
-    }
-  }
-  return h;
-}
-
-float cross2(cv::Point2f o, cv::Point2f a, cv::Point2f b) {
-  return (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x);
-}
-
-float imaged_pitch(const cv::Matx33d& h) {
-  return static_cast<float>(cv::norm(apply(h, cv::Point2f(0.f, 1.f)) - apply(h, cv::Point2f(0.f, 0.f))));
-}
-
-bool plate_quad(const cv::Matx33d& h, std::array<cv::Point2f, 4>& quad) {
-  const cv::Point2f model[4] = {
-      {kPlateLo, kPlateLo},
-      {kPlateHi, kPlateLo},
-      {kPlateHi, kPlateHi},
-      {kPlateLo, kPlateHi},
-  };
-  for (int i = 0; i < 4; ++i) {
-    quad[i] = apply(h, model[i]);
-    if (!finite_point(quad[i])) {
-      return false;
-    }
-  }
-  for (int i = 0; i < 4; ++i) {
-    if (cross2(quad[i], quad[(i + 1) % 4], quad[(i + 2) % 4]) <= 0.f) {
-      return false;
-    }
-  }
-  return true;
-}
-
-float elbow_dot(const cv::Matx33d& h, cv::Point2f model, cv::Point2f model_elbow, cv::Point2f observed) {
-  const cv::Point2f predicted = apply(h, model + model_elbow * 0.25f) - apply(h, model);
-  const double pn = cv::norm(predicted);
-  const double on = cv::norm(observed);
-  if (pn < 1e-4 || on < 1e-4) {
+float gray_at(const cv::Mat& gray, double x, double y) {
+  if (x < 1.0 || y < 1.0 || x >= gray.cols - 2.0 || y >= gray.rows - 2.0) {
     return -1.f;
   }
-  return static_cast<float>(predicted.dot(observed) / (pn * on));
+  const int x0 = static_cast<int>(std::floor(x));
+  const int y0 = static_cast<int>(std::floor(y));
+  const float fx = static_cast<float>(x - x0);
+  const float fy = static_cast<float>(y - y0);
+  const float v00 = gray.at<uchar>(y0, x0);
+  const float v10 = gray.at<uchar>(y0, x0 + 1);
+  const float v01 = gray.at<uchar>(y0 + 1, x0);
+  const float v11 = gray.at<uchar>(y0 + 1, x0 + 1);
+  return (1.f - fx) * (1.f - fy) * v00 + fx * (1.f - fy) * v10 + (1.f - fx) * fy * v01 + fx * fy * v11;
 }
 
-bool elbow_agrees(const cv::Matx33d& h, cv::Point2f model, cv::Point2f model_elbow, cv::Point2f observed) {
-  return elbow_dot(h, model, model_elbow, observed) > 0.50f;
+double median_of(std::vector<double> values) {
+  if (values.empty()) {
+    return 0;
+  }
+  const std::size_t mid = values.size() / 2;
+  std::nth_element(values.begin(), values.begin() + static_cast<std::ptrdiff_t>(mid), values.end());
+  return values[mid];
 }
 
-// Zack's triangle. The cut is the histogram bin farthest under the line from the
-// mode in [begin, end] to the last occupied bin. Called once on V of the whole
-// frame, then on S of the pixels at or above that V, from the S mode toward 255.
-int triangle_threshold(const std::vector<int>& hist, int begin, int end) {
-  int peak = begin;
-  for (int i = begin + 1; i <= end; ++i) {
-    if (hist[i] > hist[peak]) {
-      peak = i;
-    }
-  }
-  int tail = end;
-  while (tail > peak && hist[tail] == 0) {
-    --tail;
-  }
-  if (tail <= peak + 1) {
-    return peak;
-  }
-  const float dx = static_cast<float>(tail - peak);
-  const float dy = static_cast<float>(hist[tail] - hist[peak]);
-  const float norm = std::sqrt(dx * dx + dy * dy);
-  int best = peak;
-  float best_dist = -1.f;
-  for (int i = peak; i <= tail; ++i) {
-    const float dist = std::abs(dx * static_cast<float>(hist[i] - hist[peak]) - dy * static_cast<float>(i - peak)) / norm;
-    if (dist > best_dist) {
-      best_dist = dist;
-      best = i;
-    }
-  }
-  return best;
-}
-
-struct Score {
-  float recall = 0.f;
-  float coverage = 0.f;
-  float center_ok = 0.f;
-  float mouth_ok = 0.f;
-  int center_in = 0;
-  int mouth_in = 0;
-  bool pass = false;
-};
-
-Score score_fit(const cv::Mat& hsv, const cv::Matx33d& h, int support, int v_cut, int s_cut) {
-  Score score;
-  const std::vector<cv::Point2f>& lamps = lamp_samples();
-  int in_frame = 0;
-  int bright = 0;
-  for (cv::Point2f model : lamps) {
-    const cv::Point2f p = apply(h, model);
-    const int x = cvRound(p.x);
-    const int y = cvRound(p.y);
-    if (x < 0 || y < 0 || x >= hsv.cols || y >= hsv.rows) {
-      continue;
-    }
-    ++in_frame;
-    const cv::Vec3b pix = hsv.at<cv::Vec3b>(y, x);
-    if (pix[2] >= v_cut && pix[1] <= s_cut) {
-      ++bright;
-    }
-  }
-  auto tally = [&](const std::vector<cv::Point2f>& samples, int& inside, int& dark_count) {
-    for (cv::Point2f model : samples) {
-      const cv::Point2f p = apply(h, model);
-      const int x = cvRound(p.x);
-      const int y = cvRound(p.y);
-      if (x < 0 || y < 0 || x >= hsv.cols || y >= hsv.rows) {
-        continue;
-      }
-      ++inside;
-      if (hsv.at<cv::Vec3b>(y, x)[2] < v_cut) {
-        ++dark_count;
-      }
-    }
-  };
-  int center_dark = 0;
-  int mouth_dark = 0;
-  const DarkSets& dark = dark_sets();
-  tally(dark.center, score.center_in, center_dark);
-  tally(dark.mouths, score.mouth_in, mouth_dark);
-  score.coverage = lamps.empty() ? 0.f : static_cast<float>(in_frame) / static_cast<float>(lamps.size());
-  if (in_frame < 12) {
-    return score;
-  }
-  score.recall = static_cast<float>(bright) / static_cast<float>(in_frame);
-  score.center_ok = score.center_in == 0 ? 0.f : static_cast<float>(center_dark) / static_cast<float>(score.center_in);
-  score.mouth_ok = score.mouth_in == 0 ? 0.f : static_cast<float>(mouth_dark) / static_cast<float>(score.mouth_in);
-  const bool mouth_pass = score.mouth_in < 24 || score.mouth_ok >= 0.50f;
-  if (support <= 1) {
-    score.pass = score.coverage >= 0.28f && score.recall >= 0.75f && score.center_in >= 12 && score.center_ok >= 0.75f &&
-                 mouth_pass;
-  } else {
-    const bool center_pass = score.center_in < 8 || score.center_ok >= 0.70f;
-    score.pass = score.coverage >= 0.20f && score.recall >= 0.55f && center_pass && mouth_pass;
-  }
-  return score;
-}
-
-std::array<cv::Point2f, 4> grow_quad(const std::array<cv::Point2f, 4>& quad, float scale) {
-  cv::Point2f center(0.f, 0.f);
-  for (const cv::Point2f& corner : quad) {
-    center += corner;
-  }
-  center *= 0.25f;
-  std::array<cv::Point2f, 4> grown{};
+double shoelace(const std::array<cv::Point2d, 4>& p) {
+  double sum = 0;
   for (int i = 0; i < 4; ++i) {
-    grown[i] = center + (quad[i] - center) * scale;
-  }
-  return grown;
-}
-
-bool point_in_quad(const std::array<cv::Point2f, 4>& quad, cv::Point2f p) {
-  for (int i = 0; i < 4; ++i) {
-    if (cross2(quad[i], quad[(i + 1) % 4], p) < 0.f) {
-      return false;
-    }
-  }
-  return true;
-}
-
-struct Blob {
-  cv::Point2f centroid;
-  cv::Point2f elbow;
-  cv::Point2f arm_x;
-  cv::Point2f arm_y;
-  cv::Point2f semantic[4]{};
-  float area = 0.f;
-  float solidity = 0.f;
-  float extent = 0.f;
-  float aspect = 0.f;
-  float defect = 0.f;
-  float mean_side = 0.f;
-  bool is_l = false;
-  bool is_piece = false;
-  float quality = 0.f;
-  std::vector<cv::Point2f> edge;
-};
-
-// A cell L inside the ordered plate has to land on a solid lamp. Blobs outside
-// that region are other objects and do not reject the pose. Piece fragments are
-// not in this list: their shape gate does not overlap the cell L.
-bool explains_observed(const cv::Matx33d& h, const std::array<cv::Point2f, 4>& ordered, const std::vector<Blob>& ells) {
-  const float pitch = imaged_pitch(h);
-  if (!(pitch > 1.f)) {
-    return false;
-  }
-  const std::array<cv::Point2f, 4> region = grow_quad(ordered, 1.20f);
-  for (const Blob& blob : ells) {
-    if (!point_in_quad(region, blob.centroid)) {
-      continue;
-    }
-    float nearest = 1e9f;
-    for (const LampId& lamp : kLamps) {
-      nearest = std::min(nearest, static_cast<float>(cv::norm(apply(h, lamp.at) - blob.centroid)));
-    }
-    if (nearest > 0.20f * pitch) {
-      return false;
-    }
-  }
-  return true;
-}
-
-struct Fit {
-  Detection detection;
-  std::array<cv::Point2f, 4> measured{};
-  float mouth_ok = 0.f;
-  int mouth_in = 0;
-  // Lamps were named from the previous plate, then refit on this frame.
-  bool tracked = false;
-  // Four outer edges of this labeling met as one homography.
-  bool from_lines = false;
-};
-
-// A plate edge is the bright arm segments on one drawing line, separated by a dark
-// gap. Lines stay lines under a homography, so four outer edges determine the
-// plate together. Fewer than four leaves the lamp pose untouched: one edge is
-// not allowed to move one corner.
-std::array<cv::Point2f, 4> refine_plate(const cv::Matx33d& h, const std::array<cv::Point2f, 4>& quad,
-                                        const std::vector<Blob>& ells, const std::vector<Blob>& pieces,
-                                        const std::vector<Blob>& rims, int cols, int rows, bool& from_lines) {
-  from_lines = false;
-  const float pitch = imaged_pitch(h);
-  if (!(pitch > 1.f) || cols < 3 || rows < 3) {
-    return quad;
-  }
-  struct EdgeSeg {
-    int side;
-    float x0;
-    float y0;
-    float x1;
-    float y1;
-  };
-  static const EdgeSeg kSegs[] = {
-      {0, 0.f, 0.f, 30.f, 0.f},  {0, 50.f, 0.f, 58.f, 0.f},  {0, 66.f, 0.f, 80.f, 0.f},
-      {1, 80.f, 0.f, 80.f, 14.f}, {1, 80.f, 22.f, 80.f, 30.f}, {1, 80.f, 50.f, 80.f, 80.f},
-      {2, 0.f, 80.f, 30.f, 80.f}, {2, 50.f, 80.f, 80.f, 80.f}, {3, 0.f, 0.f, 0.f, 30.f},
-      {3, 0.f, 50.f, 0.f, 80.f},
-  };
-  const float arm = static_cast<float>(kArm) / kPitch;
-  const cv::Point2f inward[4] = {{0.f, arm}, {-arm, 0.f}, {0.f, -arm}, {arm, 0.f}};
-  struct Candidate {
-    cv::Point2f point;
-    float signed_in;
-  };
-  std::array<std::vector<Candidate>, 4> candidates;
-  std::array<cv::Point2f, 4> axis{};
-  std::array<float, 4> axis_len{};
-  std::array<float, 4> side_thickness{};
-  constexpr float kAlong = 0.35f;
-
-  for (const EdgeSeg& seg : kSegs) {
-    const cv::Point2f model_a = to_model(seg.x0, seg.y0);
-    const cv::Point2f model_b = to_model(seg.x1, seg.y1);
-    const cv::Point2f a = apply(h, model_a);
-    const cv::Point2f b = apply(h, model_b);
-    if (!finite_point(a) || !finite_point(b)) {
-      continue;
-    }
-    const cv::Point2f ab = b - a;
-    const float ab_len = static_cast<float>(cv::norm(ab));
-    if (ab_len < 1.f) {
-      continue;
-    }
-    const cv::Point2f mid = (model_a + model_b) * 0.5f;
-    const cv::Point2f dir = ab * (1.f / ab_len);
-    cv::Point2f normal(-dir.y, dir.x);
-    const cv::Point2f inward_img = apply(h, mid + inward[seg.side]) - apply(h, mid);
-    if (normal.dot(inward_img) < 0.f) {
-      normal = -normal;
-    }
-    const float thickness = normal.dot(inward_img);
-    if (!(thickness > 1.f)) {
-      continue;
-    }
-    const int side = seg.side;
-    if (ab_len > axis_len[static_cast<size_t>(side)]) {
-      axis[static_cast<size_t>(side)] = dir;
-      axis_len[static_cast<size_t>(side)] = ab_len;
-      side_thickness[static_cast<size_t>(side)] = thickness;
-    }
-    const float wide = std::max(1.20f * thickness, 0.70f * pitch);
-    const float ab2 = ab.dot(ab);
-    const float x_max = static_cast<float>(cols - 2);
-    const float y_max = static_cast<float>(rows - 2);
-    const cv::Point2f mid_img = (a + b) * 0.5f;
-    const float near_blob = 1.20f * pitch;
-    auto take = [&](const std::vector<Blob>& blobs) {
-      for (const Blob& blob : blobs) {
-        if (static_cast<float>(cv::norm(blob.centroid - mid_img)) > near_blob) {
-          continue;
-        }
-        for (const cv::Point2f& point : blob.edge) {
-          if (point.x < 1.f || point.y < 1.f || point.x > x_max || point.y > y_max) {
-            continue;
-          }
-          const float t = (point - a).dot(ab) / ab2;
-          if (t < -kAlong || t > 1.f + kAlong) {
-            continue;
-          }
-          const float signed_in = (point - a).dot(normal);
-          if (signed_in < -wide || signed_in > wide) {
-            continue;
-          }
-          candidates[static_cast<size_t>(side)].push_back(Candidate{point, signed_in});
-        }
-      }
-    };
-    take(ells);
-    take(pieces);
-    take(rims);
-  }
-
-  std::array<std::vector<cv::Point2f>, 4> samples;
-  for (int side = 0; side < 4; ++side) {
-    std::vector<Candidate>& pool = candidates[static_cast<size_t>(side)];
-    const float thickness = side_thickness[static_cast<size_t>(side)];
-    if (pool.size() < 12 || !(thickness > 1.f)) {
-      continue;
-    }
-    std::sort(pool.begin(), pool.end(), [](const Candidate& lhs, const Candidate& rhs) {
-      return lhs.signed_in < rhs.signed_in;
-    });
-    const float ref = pool[pool.size() / 5].signed_in;
-    if (ref > 0.55f * thickness || ref < -0.75f * pitch) {
-      continue;
-    }
-    const float outer = ref - 0.10f * thickness;
-    const float inner = ref + 0.35f * thickness;
-    std::vector<cv::Point2f>& kept = samples[static_cast<size_t>(side)];
-    kept.reserve(pool.size());
-    for (const Candidate& cand : pool) {
-      if (cand.signed_in >= outer && cand.signed_in <= inner) {
-        kept.push_back(cand.point);
-      }
-    }
-  }
-
-  struct SideLine {
-    bool ok = false;
-    cv::Point2f origin;
-    cv::Point2f direction;
-    float thickness = 0.f;
-  };
-  std::array<SideLine, 4> lines{};
-  for (int side = 0; side < 4; ++side) {
-    const std::vector<cv::Point2f>& pts = samples[static_cast<size_t>(side)];
-    const cv::Point2f direction = axis[static_cast<size_t>(side)];
-    if (pts.size() < 12 || static_cast<float>(cv::norm(direction)) < 0.5f) {
-      continue;
-    }
-    float lo = 1e9f;
-    float hi = -1e9f;
-    for (const cv::Point2f& point : pts) {
-      const float along = point.dot(direction);
-      lo = std::min(lo, along);
-      hi = std::max(hi, along);
-    }
-    if (hi - lo < 0.35f * pitch) {
-      continue;
-    }
-    cv::Vec4f fitted;
-    cv::fitLine(pts, fitted, cv::DIST_HUBER, 0, 0.01, 0.01);
-    SideLine line;
-    line.direction = {fitted[0], fitted[1]};
-    line.origin = {fitted[2], fitted[3]};
-    if (static_cast<float>(cv::norm(line.direction)) < 1e-6f || !finite_point(line.origin) ||
-        !finite_point(line.direction)) {
-      continue;
-    }
-    if (line.direction.dot(direction) < 0.f) {
-      line.direction *= -1.f;
-    }
-    line.thickness = side_thickness[static_cast<size_t>(side)];
-    // Far enough from this edge's direction to be another contour, including at
-    // a steep tilt where the image of the side is no longer parallel to the
-    // lamp-affine edge. About twenty degrees.
-    if (line.direction.dot(direction) < 0.940f) {
-      continue;
-    }
-    line.ok = true;
-    lines[static_cast<size_t>(side)] = line;
-  }
-
-  auto convex = [](const std::array<cv::Point2f, 4>& corners) {
-    for (int i = 0; i < 4; ++i) {
-      if (!finite_point(corners[static_cast<size_t>(i)])) {
-        return false;
-      }
-      if (cross2(corners[static_cast<size_t>(i)], corners[static_cast<size_t>((i + 1) % 4)],
-                 corners[static_cast<size_t>((i + 2) % 4)]) <= 0.f) {
-        return false;
-      }
-    }
-    return true;
-  };
-
-  int ready = 0;
-  for (const SideLine& line : lines) {
-    if (line.ok) {
-      ++ready;
-    }
-  }
-  // Top meets left, top meets right, bottom meets right, bottom meets left.
-  const int meet[4][2] = {{0, 3}, {0, 1}, {2, 1}, {2, 3}};
-  if (ready == 4) {
-    std::array<cv::Point2f, 4> corners{};
-    bool hits = true;
-    for (int corner = 0; corner < 4; ++corner) {
-      const SideLine& first = lines[static_cast<size_t>(meet[corner][0])];
-      const SideLine& second = lines[static_cast<size_t>(meet[corner][1])];
-      const float cross = first.direction.x * second.direction.y - first.direction.y * second.direction.x;
-      if (std::abs(cross) < 1e-4f) {
-        hits = false;
-        break;
-      }
-      const cv::Point2f delta = second.origin - first.origin;
-      const float t = (delta.x * second.direction.y - delta.y * second.direction.x) / cross;
-      const cv::Point2f hit = first.origin + first.direction * t;
-      if (!finite_point(hit) ||
-          static_cast<float>(cv::norm(hit - quad[static_cast<size_t>(corner)])) > 0.25f * pitch) {
-        hits = false;
-        break;
-      }
-      corners[static_cast<size_t>(corner)] = hit;
-    }
-    if (hits && convex(corners)) {
-      const std::vector<cv::Point2f> src = {
-          {kPlateLo, kPlateLo},
-          {kPlateHi, kPlateLo},
-          {kPlateHi, kPlateHi},
-          {kPlateLo, kPlateHi},
-      };
-      const std::vector<cv::Point2f> dst(corners.begin(), corners.end());
-      const cv::Matx33d pose = from_mat(cv::getPerspectiveTransform(src, dst), 3);
-      const float pose_pitch = imaged_pitch(pose);
-      const float linear = static_cast<float>(pose(0, 0) * pose(1, 1) - pose(0, 1) * pose(1, 0));
-      if (finite_h(pose) && linear > 0.f && pose_pitch > 0.75f * pitch && pose_pitch < 1.25f * pitch &&
-          explains_observed(pose, corners, ells)) {
-        from_lines = true;
-        return corners;
-      }
-    }
-  }
-  return quad;
-}
-
-void consider(const cv::Mat& hsv, const cv::Matx33d& h, int support, int v_cut, int s_cut, std::vector<Fit>& passed,
-              const std::vector<Blob>& ells, const std::vector<Blob>& pieces, const std::vector<Blob>& rims,
-              bool tracked = false) {
-  if (!finite_h(h) || std::abs(h(2, 2)) < 1e-8) {
-    return;
-  }
-  std::array<cv::Point2f, 4> quad{};
-  if (!plate_quad(h, quad) || !explains_observed(h, quad, ells)) {
-    return;
-  }
-  const Score score = score_fit(hsv, h, support, v_cut, s_cut);
-  // A carried plate already has its lamps. A mouth that is leaving the frame must
-  // not throw that plate away when the fresh labeling has jumped.
-  if (!score.pass && !(tracked && score.recall >= 0.45f && score.coverage >= 0.15f)) {
-    return;
-  }
-  Fit fit;
-  fit.detection.found = true;
-  bool from_lines = false;
-  const std::array<cv::Point2f, 4> measured =
-      refine_plate(h, quad, ells, pieces, rims, hsv.cols, hsv.rows, from_lines);
-  // The kept corners are this frame's pose: the four-edge homography when it
-  // locks, otherwise the lamp affine or similarity with no corner edited alone.
-  fit.detection.corners = measured;
-  fit.measured = measured;
-  fit.from_lines = from_lines;
-  fit.detection.support = from_lines ? 4 : support;
-  fit.detection.score = score.recall;
-  fit.mouth_ok = score.mouth_ok;
-  fit.mouth_in = score.mouth_in;
-  fit.tracked = tracked;
-  passed.push_back(fit);
-}
-
-bool better_fit(const Fit& a, const Fit& b) {
-  const bool a_mouth = a.mouth_in >= 24;
-  const bool b_mouth = b.mouth_in >= 24;
-  if (a_mouth && b_mouth) {
-    if (a.mouth_ok > b.mouth_ok + 0.20f) {
-      return true;
-    }
-    if (b.mouth_ok > a.mouth_ok + 0.20f) {
-      return false;
-    }
-  }
-  if (a.detection.score > b.detection.score + 0.05f) {
-    return true;
-  }
-  if (b.detection.score > a.detection.score + 0.05f) {
-    return false;
-  }
-  if (a.detection.support != b.detection.support) {
-    return a.detection.support > b.detection.support;
-  }
-  return a.detection.score > b.detection.score;
-}
-
-// Previous lamp-model plate. The drawn corners are the edge intersections of
-// whichever labeling was kept. A miss clears this. Nothing is drawn from it
-// unless the current frame still has lamps at the predicted places.
-struct PlateMemory {
-  bool found = false;
-  std::array<cv::Point2f, 4> corners{};
-  cv::Point2f velocity{};
-};
-PlateMemory& plate_memory() {
-  static PlateMemory memory;
-  return memory;
-}
-
-float median4(float a, float b, float c, float d) {
-  float values[4] = {a, b, c, d};
-  std::sort(values, values + 4);
-  return 0.5f * (values[1] + values[2]);
-}
-
-bool quad_convex(const std::array<cv::Point2f, 4>& corners) {
-  for (int i = 0; i < 4; ++i) {
-    if (!finite_point(corners[static_cast<size_t>(i)])) {
-      return false;
-    }
-    if (cross2(corners[static_cast<size_t>(i)], corners[static_cast<size_t>((i + 1) % 4)],
-               corners[static_cast<size_t>((i + 2) % 4)]) <= 0.f) {
-      return false;
-    }
-  }
-  return true;
-}
-
-// Time identifies the lamps. The pose is whatever those lamps measure now.
-// An empty frame clears the memory, so a miss is never filled from the frame before it.
-Detection choose_fit(const std::vector<Fit>& passed) {
-  PlateMemory& memory = plate_memory();
-  if (passed.empty()) {
-    memory.found = false;
-    memory.velocity = {};
-    return {};
-  }
-  const Fit* tracked = nullptr;
-  const Fit* leader = nullptr;
-  for (const Fit& fit : passed) {
-    if (fit.tracked) {
-      tracked = &fit;
-      continue;
-    }
-    if (leader == nullptr || better_fit(fit, *leader)) {
-      leader = &fit;
-    }
-  }
-  const Fit* fresh = leader;
-  if (fresh != nullptr && memory.found) {
-    const float side = std::max(1.f, static_cast<float>(cv::norm(memory.corners[1] - memory.corners[0])));
-    float nearest_dist = 0.35f * side;
-    const Fit* nearest = nullptr;
-    for (const Fit& fit : passed) {
-      if (fit.tracked) {
-        continue;
-      }
-      if (fit.detection.score + 0.05f < leader->detection.score) {
-        continue;
-      }
-      if (leader->mouth_in >= 24 && fit.mouth_in >= 24 && fit.mouth_ok + 0.20f < leader->mouth_ok) {
-        continue;
-      }
-      float dist = 0.f;
-      for (int k = 0; k < 4; ++k) {
-        dist = std::max(dist, static_cast<float>(cv::norm(fit.detection.corners[static_cast<size_t>(k)] -
-                                                          memory.corners[static_cast<size_t>(k)])));
-      }
-      if (dist < nearest_dist) {
-        nearest_dist = dist;
-        nearest = &fit;
-      }
-    }
-    if (nearest != nullptr) {
-      fresh = nearest;
-    }
-  }
-  // Four edges that meet are a measured homography and outrank a lamp pose that
-  // could not lock them. Among those, the lamps named from the previous frame
-  // win. Nothing here keeps the previous quad as a shape.
-  const Fit* lined = nullptr;
-  for (const Fit& fit : passed) {
-    if (!fit.from_lines) {
-      continue;
-    }
-    if (lined == nullptr || (fit.tracked && !lined->tracked) ||
-        (fit.tracked == lined->tracked && better_fit(fit, *lined))) {
-      lined = &fit;
-    }
-  }
-  const Fit* chosen = lined != nullptr ? lined : (tracked != nullptr ? tracked : fresh);
-  if (chosen == nullptr) {
-    memory.found = false;
-    memory.velocity = {};
-    return {};
-  }
-  cv::Point2f velocity{};
-  if (memory.found) {
-    float dx[4];
-    float dy[4];
-    for (int k = 0; k < 4; ++k) {
-      dx[k] = chosen->detection.corners[static_cast<size_t>(k)].x - memory.corners[static_cast<size_t>(k)].x;
-      dy[k] = chosen->detection.corners[static_cast<size_t>(k)].y - memory.corners[static_cast<size_t>(k)].y;
-    }
-    velocity = {median4(dx[0], dx[1], dx[2], dx[3]), median4(dy[0], dy[1], dy[2], dy[3])};
-  }
-  memory.found = true;
-  memory.corners = chosen->measured;
-  memory.velocity = velocity;
-  Detection result = chosen->detection;
-  result.corners = chosen->measured;
-  return result;
-}
-
-cv::Matx33d similarity(cv::Point2f m0, cv::Point2f m1, cv::Point2f i0, cv::Point2f i1) {
-  const cv::Point2f vm = m1 - m0;
-  const cv::Point2f vi = i1 - i0;
-  const float vm_n = static_cast<float>(cv::norm(vm));
-  const float vi_n = static_cast<float>(cv::norm(vi));
-  cv::Matx33d h = cv::Matx33d::eye();
-  if (vm_n < 1e-4f || vi_n < 1e-4f) {
-    h(2, 2) = 0;
-    return h;
-  }
-  const float scale = vi_n / vm_n;
-  const float ang = std::atan2(vi.y, vi.x) - std::atan2(vm.y, vm.x);
-  const float c = std::cos(ang) * scale;
-  const float s = std::sin(ang) * scale;
-  const cv::Point2f t = i0 - cv::Point2f(c * m0.x - s * m0.y, s * m0.x + c * m0.y);
-  h(0, 0) = c;
-  h(0, 1) = -s;
-  h(0, 2) = t.x;
-  h(1, 0) = s;
-  h(1, 1) = c;
-  h(1, 2) = t.y;
-  return h;
-}
-
-cv::Point2f unit_vec(cv::Point2f v) {
-  const float n = static_cast<float>(cv::norm(v));
-  if (n < 1e-4f) {
-    return {0.f, 0.f};
-  }
-  return v * (1.f / n);
-}
-
-bool positive_det(const cv::Matx33d& h) { return h(0, 0) * h(1, 1) - h(0, 1) * h(1, 0) > 0.0; }
-
-bool corners_stay(const cv::Matx33d& base, const cv::Matx33d& refined, float pitch) {
-  const cv::Point2f model[4] = {
-      {kPlateLo, kPlateLo},
-      {kPlateHi, kPlateLo},
-      {kPlateHi, kPlateHi},
-      {kPlateLo, kPlateHi},
-  };
-  for (const cv::Point2f& point : model) {
-    if (cv::norm(apply(refined, point) - apply(base, point)) > 0.10f * pitch) {
-      return false;
-    }
-  }
-  return true;
-}
-
-struct PieceHit {
-  const Blob* blob = nullptr;
-  cv::Point2f model;
-};
-
-// Prefer the corner fragment. An end square is used only when the corner is absent.
-// The area is compared with the area the drawing predicts at this frame's pitch.
-PieceHit match_piece(const cv::Matx33d& h, float pitch, const std::vector<Blob>& pieces) {
-  PieceHit hit;
-  if (!(pitch > 1.f)) {
-    return hit;
-  }
-  const float limit = 0.12f * pitch;
-  const float px = pitch / kPitch;
-  const std::array<PieceModel, 3>& models = piece_models();
-  auto search = [&](int begin, int end) {
-    const Blob* best = nullptr;
-    cv::Point2f model;
-    float best_dist = limit;
-    for (int i = begin; i < end; ++i) {
-      const cv::Point2f predicted = apply(h, models[static_cast<size_t>(i)].at);
-      const float expected = models[static_cast<size_t>(i)].area * px * px;
-      if (!(expected > 1.f)) {
-        continue;
-      }
-      for (const Blob& blob : pieces) {
-        const float dist = static_cast<float>(cv::norm(blob.centroid - predicted));
-        if (dist > best_dist) {
-          continue;
-        }
-        const float ratio = blob.area / expected;
-        if (ratio < 0.75f || ratio > 1.40f) {
-          continue;
-        }
-        best_dist = dist;
-        best = &blob;
-        model = models[static_cast<size_t>(i)].at;
-      }
-    }
-    return PieceHit{best, model};
-  };
-  const PieceHit corner = search(0, 1);
-  if (corner.blob != nullptr) {
-    return corner;
-  }
-  return search(1, static_cast<int>(models.size()));
-}
-
-// A solid L seen at an angle is an affine image of the drawing, plus a small
-// perspective residual across one lamp. Whitening by the covariance removes
-// translation, rotation, scale and shear. What remains is a rotation, scored
-// by the overlap of the filled canonical silhouettes.
-struct Cloud {
-  std::vector<cv::Point2d> pts;
-  cv::Point2d mean;
-  cv::Matx22d white = cv::Matx22d::eye();
-  cv::Matx22d white_inv = cv::Matx22d::eye();
-  bool ok = false;
-};
-
-Cloud whiten(const std::vector<cv::Point2d>& pts) {
-  Cloud cloud;
-  cloud.pts = pts;
-  if (pts.size() < 8) {
-    return cloud;
-  }
-  for (const cv::Point2d& point : pts) {
-    cloud.mean += point;
-  }
-  cloud.mean *= 1.0 / static_cast<double>(pts.size());
-  cv::Matx22d cov = cv::Matx22d::zeros();
-  for (const cv::Point2d& point : pts) {
-    const cv::Point2d d = point - cloud.mean;
-    cov(0, 0) += d.x * d.x;
-    cov(0, 1) += d.x * d.y;
-    cov(1, 0) += d.y * d.x;
-    cov(1, 1) += d.y * d.y;
-  }
-  cov *= 1.0 / static_cast<double>(pts.size());
-  cv::Mat values;
-  cv::Mat vectors;
-  cv::SVD::compute(cv::Mat(cov), values, vectors, cv::noArray());
-  if (values.rows < 2 || values.at<double>(1) < 1e-6 || values.at<double>(1) < 1e-3 * values.at<double>(0)) {
-    return cloud;
-  }
-  cv::Matx22d basis;
-  basis(0, 0) = vectors.at<double>(0, 0);
-  basis(1, 0) = vectors.at<double>(1, 0);
-  basis(0, 1) = vectors.at<double>(0, 1);
-  basis(1, 1) = vectors.at<double>(1, 1);
-  if (cv::determinant(basis) < 0.0) {
-    basis(0, 0) = -basis(0, 0);
-    basis(1, 0) = -basis(1, 0);
-  }
-  const double s0 = 1.0 / std::sqrt(values.at<double>(0));
-  const double s1 = 1.0 / std::sqrt(values.at<double>(1));
-  const cv::Matx22d root(s0, 0.0, 0.0, s1);
-  const cv::Matx22d root_inv(1.0 / s0, 0.0, 0.0, 1.0 / s1);
-  cloud.white = root * basis.t();
-  cloud.white_inv = basis * root_inv;
-  cloud.ok = true;
-  return cloud;
-}
-
-std::vector<cv::Point2d> sample_poly(const cv::Point2d* poly, int n, double step) {
-  std::vector<cv::Point2d> out;
-  for (int i = 0; i < n; ++i) {
-    const cv::Point2d a = poly[i];
-    const cv::Point2d b = poly[(i + 1) % n];
-    const double len = cv::norm(b - a);
-    const int pieces = std::max(1, static_cast<int>(std::ceil(len / step)));
-    for (int k = 0; k < pieces; ++k) {
-      out.push_back(a + (b - a) * (static_cast<double>(k) / static_cast<double>(pieces)));
-    }
-  }
-  return out;
-}
-
-const Cloud& solid_cloud() {
-  static const Cloud cloud = [] {
-    const cv::Point2d poly[] = {{0, 0}, {30, 0}, {30, 8}, {8, 8}, {8, 30}, {0, 30}};
-    return whiten(sample_poly(poly, 6, 0.4));
-  }();
-  return cloud;
-}
-
-constexpr int kCanon = 96;
-
-cv::Mat canon_mask(const std::vector<cv::Point2d>& whitened) {
-  cv::Mat mask(kCanon, kCanon, CV_8UC1, cv::Scalar(0));
-  std::vector<cv::Point> pix;
-  pix.reserve(whitened.size());
-  constexpr double kScale = 14.0;
-  for (const cv::Point2d& point : whitened) {
-    pix.emplace_back(cvRound(kCanon * 0.5 + point.x * kScale), cvRound(kCanon * 0.5 + point.y * kScale));
-  }
-  const std::vector<std::vector<cv::Point>> polys = {pix};
-  cv::fillPoly(mask, polys, cv::Scalar(255));
-  return mask;
-}
-
-// 96*96 bits, one word per 64 pixels. Overlap is a population count, so each
-// contour pays for one raster of itself and then reuses the solid-L masks.
-constexpr int kCanonWords = (kCanon * kCanon) / 64;
-using BitMask = std::array<std::uint64_t, kCanonWords>;
-
-BitMask pack_mask(const cv::Mat& mask) {
-  BitMask bits{};
-  int index = 0;
-  for (int row = 0; row < mask.rows; ++row) {
-    const uchar* pix = mask.ptr<uchar>(row);
-    for (int col = 0; col < mask.cols; ++col, ++index) {
-      if (pix[col] != 0) {
-        bits[static_cast<size_t>(index >> 6)] |= std::uint64_t{1} << (index & 63);
-      }
-    }
-  }
-  return bits;
-}
-
-double bit_iou(const BitMask& a, const BitMask& b) {
-  int both = 0;
-  int either = 0;
-  for (int i = 0; i < kCanonWords; ++i) {
-    const std::uint64_t aw = a[static_cast<size_t>(i)];
-    const std::uint64_t bw = b[static_cast<size_t>(i)];
-    both += __builtin_popcountll(aw & bw);
-    either += __builtin_popcountll(aw | bw);
-  }
-  return either < 1 ? 0.0 : static_cast<double>(both) / static_cast<double>(either);
-}
-
-const BitMask& model_bits_deg(int deg) {
-  static const std::array<BitMask, 180> masks = [] {
-    std::array<BitMask, 180> built{};
-    const Cloud& model = solid_cloud();
-    std::vector<cv::Point2d> model_w;
-    model_w.reserve(model.pts.size());
-    for (const cv::Point2d& point : model.pts) {
-      model_w.push_back(model.white * (point - model.mean));
-    }
-    for (int step = 0; step < 180; ++step) {
-      const double rad = (step * 2) * CV_PI / 180.0;
-      const double c = std::cos(rad);
-      const double s = std::sin(rad);
-      std::vector<cv::Point2d> spun;
-      spun.reserve(model_w.size());
-      for (const cv::Point2d& point : model_w) {
-        spun.emplace_back(c * point.x - s * point.y, s * point.x + c * point.y);
-      }
-      built[static_cast<size_t>(step)] = pack_mask(canon_mask(spun));
-    }
-    return built;
-  }();
-  int wrapped = deg % 360;
-  if (wrapped < 0) {
-    wrapped += 360;
-  }
-  return masks[static_cast<size_t>(wrapped / 2)];
-}
-
-struct ShapeHit {
-  float score = 0.f;
-  double angle = 0.0;
-  bool ok = false;
-};
-
-ShapeHit match_solid(const Cloud& image) {
-  ShapeHit hit;
-  const Cloud& model = solid_cloud();
-  if (!model.ok || !image.ok) {
-    return hit;
-  }
-  std::vector<cv::Point2d> image_w;
-  image_w.reserve(image.pts.size());
-  for (const cv::Point2d& point : image.pts) {
-    image_w.push_back(image.white * (point - image.mean));
-  }
-  const BitMask image_bits = pack_mask(canon_mask(image_w));
-  auto score_at = [&](int deg) { return bit_iou(model_bits_deg(deg), image_bits); };
-  int best_deg = 0;
-  double best = -1.0;
-  for (int deg = 0; deg < 360; deg += 8) {
-    const double score = score_at(deg);
-    if (score > best) {
-      best = score;
-      best_deg = deg;
-    }
-  }
-  for (int deg = best_deg - 8; deg <= best_deg + 8; deg += 2) {
-    int wrapped = deg % 360;
-    if (wrapped < 0) {
-      wrapped += 360;
-    }
-    const double score = score_at(wrapped);
-    if (score > best) {
-      best = score;
-      best_deg = wrapped;
-    }
-  }
-  hit.score = static_cast<float>(best);
-  hit.angle = best_deg * CV_PI / 180.0;
-  hit.ok = true;
-  return hit;
-}
-
-cv::Point2f semantic_image(const Cloud& image, double angle, cv::Point2d model_pt) {
-  const Cloud& model = solid_cloud();
-  const cv::Point2d y = model.white * (model_pt - model.mean);
-  const double c = std::cos(angle);
-  const double s = std::sin(angle);
-  const cv::Point2d z(c * y.x - s * y.y, s * y.x + c * y.y);
-  const cv::Point2d out = image.mean + image.white_inv * z;
-  return {static_cast<float>(out.x), static_cast<float>(out.y)};
-}
-
-Blob make_blob(const std::vector<cv::Point>& contour) {
-  Blob blob;
-  const double area = std::abs(cv::contourArea(contour));
-  if (area < 1.0 || contour.size() < 8) {
-    return blob;
-  }
-  const cv::Moments moments = cv::moments(contour);
-  if (moments.m00 == 0) {
-    return blob;
-  }
-  blob.centroid = cv::Point2f(static_cast<float>(moments.m10 / moments.m00), static_cast<float>(moments.m01 / moments.m00));
-  blob.area = static_cast<float>(area);
-  std::vector<cv::Point> hull;
-  cv::convexHull(contour, hull);
-  const double hull_area = std::abs(cv::contourArea(hull));
-  blob.solidity = hull_area > 1.0 ? static_cast<float>(area / hull_area) : 0.f;
-  const cv::RotatedRect rect = cv::minAreaRect(contour);
-  const float rw = std::max(rect.size.width, 1.f);
-  const float rh = std::max(rect.size.height, 1.f);
-  blob.aspect = std::min(rw, rh) / std::max(rw, rh);
-  blob.extent = blob.area / (rw * rh);
-  blob.mean_side = 0.5f * (rw + rh);
-  blob.elbow = blob.centroid - rect.center;
-  cv::Point2f rect_pts[4];
-  rect.points(rect_pts);
-  blob.arm_x = unit_vec(rect_pts[1] - rect_pts[0]);
-  blob.arm_y = unit_vec(rect_pts[2] - rect_pts[1]);
-  std::vector<int> hull_idx;
-  cv::convexHull(contour, hull_idx, false, false);
-  if (hull_idx.size() >= 3) {
-    try {
-      std::vector<cv::Vec4i> defects;
-      cv::convexityDefects(contour, hull_idx, defects);
-      float depth = 0.f;
-      for (const cv::Vec4i& defect : defects) {
-        depth = std::max(depth, defect[3] / 256.f);
-      }
-      blob.defect = depth / std::sqrt(rw * rh);
-    } catch (const cv::Exception&) {
-      blob.defect = 0.f;
-    }
-  }
-  const float elbow_ratio = static_cast<float>(cv::norm(blob.elbow)) / blob.mean_side;
-  // Frame 0 lamps overlap the canonical L at 0.88–0.92. The dimmer full lamp
-  // on frame 459 is 0.736. Bars and empty frames stay at or below 0.67.
-  std::vector<cv::Point2d> boundary;
-  boundary.reserve(contour.size());
-  for (const cv::Point& point : contour) {
-    boundary.emplace_back(point.x, point.y);
-  }
-  const bool worth_shape = contour.size() >= 24;
-  const Cloud image = worth_shape ? whiten(boundary) : Cloud{};
-  const ShapeHit shape = worth_shape ? match_solid(image) : ShapeHit{};
-  constexpr float kShape = 0.72f;
-  blob.is_l = shape.ok && shape.score >= kShape;
-  auto keep_edge = [&]() {
-    blob.edge.reserve(contour.size());
-    for (const cv::Point& point : contour) {
-      blob.edge.emplace_back(static_cast<float>(point.x), static_cast<float>(point.y));
-    }
-  };
-  if (blob.is_l) {
-    const cv::Point2d semantic[4] = {{0, 0}, {8, 8}, {30, 0}, {0, 30}};
-    for (int i = 0; i < 4; ++i) {
-      blob.semantic[i] = semantic_image(image, shape.angle, semantic[i]);
-    }
-    blob.quality = shape.score;
-    keep_edge();
-    return blob;
-  }
-  const bool piece = blob.solidity >= 0.80f && blob.extent >= 0.62f && blob.aspect >= 0.55f && blob.defect <= 0.42f;
-  if (!piece) {
-    if (contour.size() < 24) {
-      blob.area = 0.f;
-    } else {
-      keep_edge();
-    }
-    return blob;
-  }
-  blob.is_piece = true;
-  blob.quality = -(std::abs(blob.solidity - 0.632f) + std::abs(blob.extent - 0.462f) + std::abs(blob.defect - 0.47f) +
-                   std::abs(elbow_ratio - 0.219f));
-  keep_edge();
-  return blob;
-}
-
-struct Parts {
-  std::vector<Blob> ells;
-  std::vector<Blob> pieces;
-  // Bright contours that are neither a solid L nor a corner fragment. Line fitting
-  // can use a clipped arm; these blobs do not open a pose.
-  std::vector<Blob> rims;
-  int v_cut = 0;
-  int s_cut = 0;
-};
-
-Parts extract_parts(const cv::Mat& hsv) {
-  Parts parts;
-  std::vector<int> v_hist(256, 0);
-  for (int row = 0; row < hsv.rows; ++row) {
-    const cv::Vec3b* pix = hsv.ptr<cv::Vec3b>(row);
-    for (int col = 0; col < hsv.cols; ++col) {
-      ++v_hist[pix[col][2]];
-    }
-  }
-  parts.v_cut = triangle_threshold(v_hist, 0, 255);
-  std::vector<int> s_hist(256, 0);
-  for (int row = 0; row < hsv.rows; ++row) {
-    const cv::Vec3b* pix = hsv.ptr<cv::Vec3b>(row);
-    for (int col = 0; col < hsv.cols; ++col) {
-      if (pix[col][2] >= parts.v_cut) {
-        ++s_hist[pix[col][1]];
-      }
-    }
-  }
-  // A one-bin spike at saturation 0 can outvote the broader lamp peak.
-  // The mode is taken on a short smooth; the foot stays on the raw histogram.
-  std::vector<float> smooth(256, 0.f);
-  constexpr int kSmooth = 8;
-  for (int i = 0; i < 256; ++i) {
-    float sum = 0.f;
-    int count = 0;
-    for (int k = -kSmooth; k <= kSmooth; ++k) {
-      const int bin = i + k;
-      if (bin >= 0 && bin < 256) {
-        sum += static_cast<float>(s_hist[static_cast<size_t>(bin)]);
-        ++count;
-      }
-    }
-    smooth[static_cast<size_t>(i)] = sum / static_cast<float>(count);
-  }
-  int smooth_mode = 0;
-  for (int i = 1; i < 256; ++i) {
-    if (smooth[static_cast<size_t>(i)] > smooth[static_cast<size_t>(smooth_mode)]) {
-      smooth_mode = i;
-    }
-  }
-  parts.s_cut = triangle_threshold(s_hist, smooth_mode, 255);
-
-  cv::Mat mask;
-  cv::inRange(hsv, cv::Scalar(0, 0, parts.v_cut), cv::Scalar(179, parts.s_cut, 255), mask);
-  std::vector<std::vector<cv::Point>> contours;
-  cv::findContours(mask, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_NONE);
-  std::vector<Blob> blobs;
-  for (const std::vector<cv::Point>& contour : contours) {
-    Blob blob = make_blob(contour);
-    if (blob.area > 0.f) {
-      blobs.push_back(blob);
-    }
-  }
-  std::sort(blobs.begin(), blobs.end(), [](const Blob& a, const Blob& b) {
-    if (a.is_l != b.is_l) {
-      return a.is_l > b.is_l;
-    }
-    return a.quality > b.quality;
-  });
-  std::vector<Blob> kept;
-  for (const Blob& blob : blobs) {
-    bool duplicate = false;
-    for (const Blob& prior : kept) {
-      if (prior.is_l != blob.is_l || prior.is_piece != blob.is_piece) {
-        continue;
-      }
-      const float limit = 0.45f * std::max(prior.mean_side, blob.mean_side);
-      if (cv::norm(prior.centroid - blob.centroid) < limit) {
-        duplicate = true;
-        break;
-      }
-    }
-    if (!duplicate) {
-      kept.push_back(blob);
-    }
-  }
-  const float x_hi = static_cast<float>(hsv.cols - 1);
-  const float y_hi = static_cast<float>(hsv.rows - 1);
-  auto cut_by_frame = [&](const Blob& blob) {
-    for (const cv::Point2f& point : blob.edge) {
-      if (point.x <= 0.f || point.y <= 0.f || point.x >= x_hi || point.y >= y_hi) {
-        return true;
-      }
-    }
-    return false;
-  };
-  for (const Blob& blob : kept) {
-    // A contour that meets the image border is not a whole lamp. Its centroid
-    // is not the model centroid, so it can only contribute edge points.
-    if (blob.is_l && !cut_by_frame(blob)) {
-      parts.ells.push_back(blob);
-    } else if (blob.is_piece && !cut_by_frame(blob)) {
-      parts.pieces.push_back(blob);
-    } else {
-      parts.rims.push_back(blob);
-    }
-  }
-  if (parts.ells.size() > 8) {
-    parts.ells.resize(8);
-  }
-  if (parts.rims.size() > 12) {
-    std::sort(parts.rims.begin(), parts.rims.end(), [](const Blob& a, const Blob& b) { return a.area > b.area; });
-    parts.rims.resize(12);
-  }
-  return parts;
-}
-
-// The gapped corner is one correspondence of its own once the solid lamps are gone.
-// The corner notch measures near 0.21 after bloom; the drawing notch is 0.303 and an
-// end square stays near 0.09, so the two populations do not overlap. The corner is
-// 160/64 = 2.5 times an end, and the recovered pitch has to predict those areas.
-void consider_gapped(const cv::Mat& hsv, const Parts& parts, std::vector<Fit>& passed) {
-  const std::vector<Blob>& pieces = parts.pieces;
-  const std::array<PieceModel, 3>& models = piece_models();
-  const int count = static_cast<int>(pieces.size());
-  for (int i = 0; i < count; ++i) {
-    const Blob& corner = pieces[static_cast<size_t>(i)];
-    if (corner.defect < 0.16f || corner.defect > 0.35f) {
-      continue;
-    }
-    for (int j = 0; j < count; ++j) {
-      if (j == i) {
-        continue;
-      }
-      const Blob& end = pieces[static_cast<size_t>(j)];
-      if (end.defect > 0.18f) {
-        continue;
-      }
-      const float ratio = corner.area / end.area;
-      if (ratio < 2.1f || ratio > 3.2f) {
-        continue;
-      }
-      for (int end_id = 1; end_id <= 2; ++end_id) {
-        const PieceModel& end_model = models[static_cast<size_t>(end_id)];
-        const cv::Matx33d sim = similarity(models[0].at, end_model.at, corner.centroid, end.centroid);
-        if (!elbow_agrees(sim, models[0].at, models[0].elbow, corner.elbow)) {
-          continue;
-        }
-        const float pitch = imaged_pitch(sim);
-        if (!(pitch > 1.f)) {
-          continue;
-        }
-        const float scale = pitch / kPitch;
-        const float corner_fit = corner.area / (models[0].area * scale * scale);
-        const float end_fit = end.area / (end_model.area * scale * scale);
-        if (corner_fit < 0.75f || corner_fit > 1.40f || end_fit < 0.75f || end_fit > 1.40f) {
-          continue;
-        }
-        consider(hsv, sim, 2, parts.v_cut, parts.s_cut, passed, parts.ells, parts.pieces, parts.rims);
-        const int other_id = 3 - end_id;
-        const PieceModel& other_model = models[static_cast<size_t>(other_id)];
-        const cv::Point2f predicted = apply(sim, other_model.at);
-        const float expected = other_model.area * scale * scale;
-        const Blob* third = nullptr;
-        float nearest = 0.12f * pitch;
-        for (int k = 0; k < count; ++k) {
-          if (k == i || k == j) {
-            continue;
-          }
-          const Blob& blob = pieces[static_cast<size_t>(k)];
-          if (blob.defect > 0.18f) {
-            continue;
-          }
-          const float dist = static_cast<float>(cv::norm(blob.centroid - predicted));
-          if (dist >= nearest) {
-            continue;
-          }
-          const float fit = blob.area / expected;
-          if (fit < 0.75f || fit > 1.40f) {
-            continue;
-          }
-          nearest = dist;
-          third = &blob;
-        }
-        if (third == nullptr) {
-          continue;
-        }
-        cv::Point2f src[3] = {models[0].at, end_model.at, other_model.at};
-        cv::Point2f dst[3] = {corner.centroid, end.centroid, third->centroid};
-        const cv::Mat affine_mat = cv::getAffineTransform(src, dst);
-        if (affine_mat.empty()) {
-          continue;
-        }
-        const cv::Matx33d affine = from_mat(affine_mat, 2);
-        if (!positive_det(affine) || !corners_stay(sim, affine, pitch) ||
-            !elbow_agrees(affine, models[0].at, models[0].elbow, corner.elbow)) {
-          continue;
-        }
-        consider(hsv, affine, 3, parts.v_cut, parts.s_cut, passed, parts.ells, parts.pieces, parts.rims);
-      }
-    }
-  }
-}
-
-struct SolidGeom {
-  cv::Point2f at[4];
-};
-
-const std::array<SolidGeom, 3>& solid_geom() {
-  static const std::array<SolidGeom, 3> geom = [] {
-    const cv::Point2f draw[3][4] = {
-        {{0.f, 0.f}, {8.f, 8.f}, {30.f, 0.f}, {0.f, 30.f}},
-        {{0.f, 80.f}, {8.f, 72.f}, {0.f, 50.f}, {30.f, 80.f}},
-        {{80.f, 80.f}, {72.f, 72.f}, {50.f, 80.f}, {80.f, 50.f}},
-    };
-    std::array<SolidGeom, 3> built{};
-    for (int lamp = 0; lamp < 3; ++lamp) {
-      for (int k = 0; k < 4; ++k) {
-        built[static_cast<size_t>(lamp)].at[k] = to_model(draw[lamp][k].x, draw[lamp][k].y);
-      }
-    }
-    return built;
-  }();
-  return geom;
-}
-
-cv::Matx33d affine_fit(const std::vector<cv::Point2f>& src, const std::vector<cv::Point2f>& dst) {
-  cv::Matx33d h = cv::Matx33d::eye();
-  h(2, 2) = 0;
-  const int n = static_cast<int>(src.size());
-  if (n < 3 || dst.size() != src.size()) {
-    return h;
-  }
-  cv::Mat design(2 * n, 6, CV_64F, cv::Scalar(0));
-  cv::Mat image(2 * n, 1, CV_64F, cv::Scalar(0));
-  for (int i = 0; i < n; ++i) {
-    const double x = src[static_cast<size_t>(i)].x;
-    const double y = src[static_cast<size_t>(i)].y;
-    design.at<double>(2 * i, 0) = x;
-    design.at<double>(2 * i, 1) = y;
-    design.at<double>(2 * i, 2) = 1.0;
-    design.at<double>(2 * i + 1, 3) = x;
-    design.at<double>(2 * i + 1, 4) = y;
-    design.at<double>(2 * i + 1, 5) = 1.0;
-    image.at<double>(2 * i, 0) = dst[static_cast<size_t>(i)].x;
-    image.at<double>(2 * i + 1, 0) = dst[static_cast<size_t>(i)].y;
-  }
-  cv::Mat solved;
-  if (!cv::solve(design, image, solved, cv::DECOMP_SVD)) {
-    return h;
-  }
-  h = cv::Matx33d::eye();
-  h(0, 0) = solved.at<double>(0);
-  h(0, 1) = solved.at<double>(1);
-  h(0, 2) = solved.at<double>(2);
-  h(1, 0) = solved.at<double>(3);
-  h(1, 1) = solved.at<double>(4);
-  h(1, 2) = solved.at<double>(5);
-  return h;
-}
-
-void append_lamp(int lamp, const Blob& blob, std::vector<cv::Point2f>& src, std::vector<cv::Point2f>& dst) {
-  const SolidGeom& geom = solid_geom()[static_cast<size_t>(lamp)];
-  for (int k = 0; k < 4; ++k) {
-    src.push_back(geom.at[k]);
-    dst.push_back(blob.semantic[k]);
-  }
-}
-
-// Centroids fix the similarity. The whitened arms have to agree with it, and a third
-// lamp has to land on that same similarity. An adjacent pair still has one 90°
-// relabeling with the same arms; the gapped mouths are what reject that labeling.
-bool arms_match(const cv::Matx33d& h, int lamp, const Blob& blob) {
-  const SolidGeom& geom = solid_geom()[static_cast<size_t>(lamp)];
-  for (int tip = 2; tip <= 3; ++tip) {
-    const cv::Point2f predicted = apply(h, geom.at[tip]) - apply(h, geom.at[0]);
-    const cv::Point2f observed = blob.semantic[tip] - blob.semantic[0];
-    const float pn = static_cast<float>(cv::norm(predicted));
-    const float on = static_cast<float>(cv::norm(observed));
-    if (pn < 1e-3f || on < 1e-3f) {
-      return false;
-    }
-    if (predicted.dot(observed) / (pn * on) < 0.50f) {
-      return false;
-    }
-  }
-  return true;
-}
-
-bool identity_ok(const std::vector<std::pair<int, const Blob*>>& used) {
-  if (used.size() < 2) {
-    return true;
-  }
-  const cv::Matx33d pose = similarity(kLamps[used[0].first].at, kLamps[used[1].first].at, used[0].second->centroid,
-                                      used[1].second->centroid);
-  if (!positive_det(pose)) {
-    return false;
-  }
-  const float pitch = imaged_pitch(pose);
-  if (!(pitch > 1.f)) {
-    return false;
-  }
-  for (int i = 0; i < static_cast<int>(used.size()); ++i) {
-    if (!arms_match(pose, used[static_cast<size_t>(i)].first, *used[static_cast<size_t>(i)].second)) {
-      return false;
-    }
-    if (i >= 2 && cv::norm(apply(pose, kLamps[used[static_cast<size_t>(i)].first].at) -
-                           used[static_cast<size_t>(i)].second->centroid) > 0.15f * pitch) {
-      return false;
-    }
-  }
-  return true;
-}
-
-// One lamp does not name the plate. Another solid L inside the plate has to be one of
-// the remaining lamps under the same centroid similarity.
-bool agrees_with_visible(const cv::Matx33d& pose, int lamp, const Blob& self, const std::vector<Blob>& ells) {
-  std::array<cv::Point2f, 4> quad{};
-  if (!plate_quad(pose, quad)) {
-    return false;
-  }
-  const float pitch = imaged_pitch(pose);
-  if (!(pitch > 1.f)) {
-    return false;
-  }
-  const std::array<cv::Point2f, 4> region = grow_quad(quad, 1.20f);
-  for (const Blob& other : ells) {
-    if (&other == &self) {
-      continue;
-    }
-    if (!point_in_quad(region, other.centroid)) {
-      continue;
-    }
-    bool matched = false;
-    for (int other_id = 0; other_id < 3; ++other_id) {
-      if (other_id == lamp) {
-        continue;
-      }
-      const std::vector<std::pair<int, const Blob*>> used = {{lamp, &self}, {other_id, &other}};
-      if (!identity_ok(used)) {
-        continue;
-      }
-      if (cv::norm(apply(pose, kLamps[other_id].at) - other.centroid) <= 0.20f * pitch) {
-        matched = true;
-        break;
-      }
-    }
-    if (!matched) {
-      return false;
-    }
-  }
-  return true;
-}
-
-// Prediction only names the lamps. Two or three named lamps are fit again, so
-// rotation and foreshortening come from this frame. One lamp cannot show a turn.
-void continue_from_previous(const cv::Mat& hsv, const std::vector<Blob>& ells, const std::vector<Blob>& pieces,
-                            const std::vector<Blob>& rims, int v_cut, int s_cut, std::vector<Fit>& passed) {
-  const PlateMemory& memory = plate_memory();
-  if (!memory.found || !quad_convex(memory.corners)) {
-    return;
-  }
-  const std::vector<cv::Point2f> src = {{kPlateLo, kPlateLo}, {kPlateHi, kPlateLo}, {kPlateHi, kPlateHi}, {kPlateLo, kPlateHi}};
-  const std::vector<cv::Point2f> dst(memory.corners.begin(), memory.corners.end());
-  const cv::Matx33d previous = from_mat(cv::getPerspectiveTransform(src, dst), 3);
-  if (!finite_h(previous)) {
-    return;
-  }
-  const float pitch = imaged_pitch(previous);
-  if (!(pitch > 1.f)) {
-    return;
-  }
-  const Blob* matched[3] = {nullptr, nullptr, nullptr};
-  std::vector<char> taken(ells.size(), 0);
-  int count = 0;
-  for (int lamp = 0; lamp < 3; ++lamp) {
-    const cv::Point2f predicted = apply(previous, kLamps[lamp].at) + memory.velocity;
-    int best = -1;
-    float best_dist = 0.45f * pitch;
-    for (int i = 0; i < static_cast<int>(ells.size()); ++i) {
-      if (taken[static_cast<size_t>(i)] != 0) {
-        continue;
-      }
-      const float dist = static_cast<float>(cv::norm(ells[static_cast<size_t>(i)].centroid - predicted));
-      if (dist < best_dist) {
-        best_dist = dist;
-        best = i;
-      }
-    }
-    if (best < 0) {
-      continue;
-    }
-    taken[static_cast<size_t>(best)] = 1;
-    matched[lamp] = &ells[static_cast<size_t>(best)];
-    ++count;
-  }
-  if (count < 1) {
-    return;
-  }
-  if (count == 1) {
-    cv::Point2f shift(0.f, 0.f);
-    for (int lamp = 0; lamp < 3; ++lamp) {
-      if (matched[lamp] == nullptr) {
-        continue;
-      }
-      shift = matched[lamp]->centroid - apply(previous, kLamps[lamp].at);
-    }
-    std::array<cv::Point2f, 4> moved{};
-    for (int k = 0; k < 4; ++k) {
-      moved[static_cast<size_t>(k)] = memory.corners[static_cast<size_t>(k)] + shift;
-    }
-    if (!quad_convex(moved)) {
-      return;
-    }
-    const std::vector<cv::Point2f> moved_dst(moved.begin(), moved.end());
-    const cv::Matx33d pose = from_mat(cv::getPerspectiveTransform(src, moved_dst), 3);
-    consider(hsv, pose, 2, v_cut, s_cut, passed, ells, pieces, rims, true);
-    return;
-  }
-  std::vector<cv::Point2f> model;
-  std::vector<cv::Point2f> image;
-  model.reserve(static_cast<size_t>(count));
-  image.reserve(static_cast<size_t>(count));
-  for (int lamp = 0; lamp < 3; ++lamp) {
-    if (matched[lamp] == nullptr) {
-      continue;
-    }
-    model.push_back(kLamps[lamp].at);
-    image.push_back(matched[lamp]->centroid);
-  }
-  const cv::Matx33d pose = count >= 3 ? affine_fit(model, image) : similarity(model[0], model[1], image[0], image[1]);
-  if (!positive_det(pose)) {
-    return;
-  }
-  consider(hsv, pose, count >= 3 ? 3 : 2, v_cut, s_cut, passed, ells, pieces, rims, true);
+    const cv::Point2d& a = p[static_cast<std::size_t>(i)];
+    const cv::Point2d& b = p[static_cast<std::size_t>((i + 1) % 4)];
+    sum += a.x * b.y - b.x * a.y;
+  }
+  return 0.5 * sum;
 }
 
 }  // namespace
 
-Detection detect_marker(const cv::Mat& bgr) {
-  Detection empty;
-  if (bgr.empty()) {
-    return empty;
+bool MarkerDetector::load(const std::string& model_path, const std::string& params_path, const cv::Mat& camera,
+                          const cv::Mat& dist, std::string& error) {
+  ready_ = false;
+  clear_track();
+  if (!load_model(model_path, model_, error) || !load_params(params_path, params_, error)) {
+    return false;
   }
-  cv::Mat hsv;
-  cv::cvtColor(bgr, hsv, cv::COLOR_BGR2HSV);
-  const Parts parts = extract_parts(hsv);
-  const std::vector<Blob>& ells = parts.ells;
-  const std::vector<Blob>& pieces = parts.pieces;
-  std::vector<Fit> passed;
-  const int n = static_cast<int>(ells.size());
-  auto accept = [&](const cv::Matx33d& h, int support) {
-    consider(hsv, h, support, parts.v_cut, parts.s_cut, passed, ells, pieces, parts.rims);
+  if (model_.notch_gap - 2.0 * params_.run_margin < params_.min_samples) {
+    error = "run_margin leaves no interior on the notch";
+    return false;
+  }
+  if (camera.empty() || camera.rows != 3 || camera.cols != 3) {
+    error = "camera matrix missing";
+    return false;
+  }
+  camera.convertTo(camera_, CV_64F);
+  if (dist.empty()) {
+    dist_ = cv::Mat::zeros(1, 5, CV_64F);
+  } else {
+    dist.convertTo(dist_, CV_64F);
+  }
+  edges_.clear();
+  // Only the outer square. Hole-facing and notch-internal edges are real
+  // borders of the lamps, but a blur bias there pulls the plate yaw while
+  // the reported corners are the outer ones.
+  const double outer = model_.outer;
+  auto on_plate = [&](const Boundary& segment) {
+    const bool horizontal = std::abs(segment.a.y - segment.b.y) < 1e-6;
+    const double coordinate = horizontal ? segment.a.y : segment.a.x;
+    return std::abs(coordinate) < 1e-6 || std::abs(coordinate - outer) < 1e-6;
   };
-  continue_from_previous(hsv, ells, pieces, parts.rims, parts.v_cut, parts.s_cut, passed);
+  for (const Boundary& segment : model_.boundary) {
+    if (!on_plate(segment)) {
+      continue;
+    }
+    const double length = cv::norm(segment.b - segment.a);
+    const int count = std::max(1, static_cast<int>(std::lround(length / params_.sample_step)));
+    int side = 0;
+    if (segment.outward.x > 0.5) {
+      side = 1;
+    } else if (segment.outward.y > 0.5) {
+      side = 2;
+    } else if (segment.outward.x < -0.5) {
+      side = 3;
+    }
+    for (int i = 0; i < count; ++i) {
+      const double t = (static_cast<double>(i) + 0.5) / static_cast<double>(count);
+      edges_.push_back({segment.a + (segment.b - segment.a) * t, segment.outward, side});
+    }
+  }
+  interior_.clear();
+  for (int i = 0; i < static_cast<int>(model_.samples.size()); ++i) {
+    const Sample& sample = model_.samples[static_cast<std::size_t>(i)];
+    const Run& run = model_.runs[static_cast<std::size_t>(sample.run)];
+    if (sample.coord >= run.a + params_.run_margin && sample.coord <= run.b - params_.run_margin) {
+      interior_.push_back(i);
+    }
+  }
+  if (edges_.empty() || interior_.empty()) {
+    error = "marker has no readable samples";
+    return false;
+  }
+  ready_ = true;
+  return true;
+}
 
-  for (int i = 0; i < n; ++i) {
-    for (int j = i + 1; j < n; ++j) {
-      for (int k = j + 1; k < n; ++k) {
-        const Blob* trio[3] = {&ells[static_cast<size_t>(i)], &ells[static_cast<size_t>(j)], &ells[static_cast<size_t>(k)]};
-        const int perms[6][3] = {{0, 1, 2}, {0, 2, 1}, {1, 0, 2}, {1, 2, 0}, {2, 0, 1}, {2, 1, 0}};
-        for (const auto& perm : perms) {
-          const std::vector<std::pair<int, const Blob*>> used = {
-              {0, trio[perm[0]]},
-              {1, trio[perm[1]]},
-              {2, trio[perm[2]]},
-          };
-          if (!identity_ok(used)) {
+std::vector<cv::Point2d> MarkerDetector::project(const Pose& pose, const std::vector<cv::Point3d>& object) const {
+  std::vector<cv::Point2d> image;
+  if (!object.empty()) {
+    cv::projectPoints(object, column(pose.r), column(pose.t), camera_, dist_, image);
+  }
+  return image;
+}
+
+std::array<cv::Point2d, 4> MarkerDetector::plate(const Pose& pose) const {
+  std::vector<cv::Point3d> object;
+  object.reserve(4);
+  for (const cv::Point2d& corner : model_.corners) {
+    object.push_back({corner.x, corner.y, 0});
+  }
+  const std::vector<cv::Point2d> image = project(pose, object);
+  std::array<cv::Point2d, 4> corners{};
+  if (image.size() == 4) {
+    for (int i = 0; i < 4; ++i) {
+      corners[static_cast<std::size_t>(i)] = image[static_cast<std::size_t>(i)];
+    }
+  }
+  return corners;
+}
+
+bool MarkerDetector::facing(const Pose& pose) const {
+  cv::Mat rotation;
+  cv::Rodrigues(column(pose.r), rotation);
+  for (const cv::Point2d& corner : model_.corners) {
+    const cv::Mat local = (cv::Mat_<double>(3, 1) << corner.x, corner.y, 0);
+    const cv::Mat world = rotation * local + column(pose.t);
+    if (world.at<double>(2) <= 1.0) {
+      return false;
+    }
+  }
+  const std::array<cv::Point2d, 4> corners = plate(pose);
+  for (const cv::Point2d& corner : corners) {
+    if (!std::isfinite(corner.x) || !std::isfinite(corner.y)) {
+      return false;
+    }
+  }
+  return shoelace(corners) > 0;
+}
+
+MarkerDetector::Orientation MarkerDetector::orient(const Pose& pose, const cv::Mat& gray, bool notch_block) const {
+  Orientation result;
+  if (interior_.empty()) {
+    return result;
+  }
+  const double center = model_.outer * 0.5;
+  std::vector<double> bright_c;
+  std::vector<double> dark_c;
+  for (int turn = 0; turn < 4; ++turn) {
+    std::vector<cv::Point3d> at_obj;
+    std::vector<cv::Point3d> in_obj;
+    at_obj.reserve(interior_.size());
+    in_obj.reserve(interior_.size());
+    for (const int index : interior_) {
+      const Sample& sample = model_.samples[static_cast<std::size_t>(index)];
+      const cv::Point2d at = rotate90(sample.at, center, turn);
+      const cv::Point2d inward = rotate90(sample.inward, center, turn);
+      at_obj.push_back({at.x, at.y, 0});
+      in_obj.push_back({inward.x, inward.y, 0});
+    }
+    const std::vector<cv::Point2d> at_img = project(pose, at_obj);
+    const std::vector<cv::Point2d> in_img = project(pose, in_obj);
+    std::vector<double> contrast(interior_.size(), 0);
+    std::vector<char> visible(interior_.size(), 0);
+    std::vector<double> pool;
+    for (std::size_t i = 0; i < interior_.size(); ++i) {
+      const float outer = gray_at(gray, at_img[i].x, at_img[i].y);
+      const float inner = gray_at(gray, in_img[i].x, in_img[i].y);
+      if (outer < 0.f || inner < 0.f) {
+        continue;
+      }
+      contrast[i] = static_cast<double>(outer - inner);
+      visible[i] = 1;
+      pool.push_back(contrast[i]);
+    }
+    if (pool.size() < 8) {
+      continue;
+    }
+    std::vector<double> sorted = pool;
+    std::sort(sorted.begin(), sorted.end());
+    const double scale = sorted[static_cast<std::size_t>(0.9 * static_cast<double>(sorted.size() - 1))];
+    if (scale < params_.min_contrast) {
+      continue;
+    }
+    struct Mark {
+      double coord = 0;
+      bool lit = false;
+    };
+    std::vector<std::vector<Mark>> marks(model_.runs.size());
+    if (turn == 0) {
+      bright_c.clear();
+      dark_c.clear();
+    }
+    for (std::size_t i = 0; i < interior_.size(); ++i) {
+      if (!visible[i]) {
+        continue;
+      }
+      const Sample& sample = model_.samples[static_cast<std::size_t>(interior_[i])];
+      const Run& run = model_.runs[static_cast<std::size_t>(sample.run)];
+      const double value = contrast[i];
+      if (turn == 0) {
+        (run.bright ? bright_c : dark_c).push_back(value);
+      }
+      if (value > params_.lit_ratio * scale) {
+        marks[static_cast<std::size_t>(sample.run)].push_back({sample.coord, true});
+      } else if (value < params_.unlit_ratio * scale) {
+        marks[static_cast<std::size_t>(sample.run)].push_back({sample.coord, false});
+      }
+    }
+    for (std::size_t run_index = 0; run_index < model_.runs.size(); ++run_index) {
+      const std::vector<Mark>& run_marks = marks[run_index];
+      if (static_cast<int>(run_marks.size()) < params_.min_samples) {
+        continue;
+      }
+      const bool expect_lit = model_.runs[run_index].bright;
+      int agree = 0;
+      int stretch = 0;
+      int longest = 0;
+      double previous = -1e9;
+      for (const Mark& mark : run_marks) {
+        const bool matches = mark.lit == expect_lit;
+        if (matches) {
+          ++agree;
+        }
+        // A dropped sample is off the edge. Do not join the two sides.
+        if (mark.coord - previous > 1.5) {
+          stretch = 0;
+        }
+        if (!matches) {
+          ++stretch;
+          longest = std::max(longest, stretch);
+        } else {
+          stretch = 0;
+        }
+        previous = mark.coord;
+      }
+      const int n = static_cast<int>(run_marks.size());
+      const int disagree = n - agree;
+      // A notch is a short dark block inside what a wrong turn treats as one
+      // solid arm. Majority agreement hides it. Once the pose sits on the
+      // border, a contiguous opposing block of min_samples is a contradiction.
+      const bool notch = notch_block && longest >= params_.min_samples;
+      bool confirmed_run = false;
+      if (disagree >= params_.agree_frac * n || notch) {
+        ++result.contradicted[turn];
+      } else if (agree >= params_.agree_frac * n) {
+        ++result.confirmed[turn];
+        confirmed_run = true;
+      }
+      const Run& run = model_.runs[run_index];
+      const bool gap = turn == 0 && !run.bright && std::abs((run.b - run.a) - model_.notch_gap) < 1e-3;
+      if (gap) {
+        ++result.gap_present[0];
+        if (confirmed_run) {
+          ++result.gap_confirmed[0];
+        }
+      }
+    }
+    result.feasible[turn] = result.contradicted[turn] == 0 && result.confirmed[turn] >= params_.min_confirmed_runs;
+  }
+  result.separation = median_of(bright_c) - median_of(dark_c);
+  return result;
+}
+
+double MarkerDetector::edge_offset(const Pose& pose, const EdgePoint& edge, const cv::Mat& gray,
+                                   bool& on_screen) const {
+  on_screen = false;
+  const std::vector<cv::Point2d> image =
+      project(pose, {{edge.p.x, edge.p.y, 0}, {edge.p.x + edge.n.x, edge.p.y + edge.n.y, 0}});
+  if (image.size() != 2) {
+    return std::numeric_limits<double>::quiet_NaN();
+  }
+  cv::Point2d direction = image[1] - image[0];
+  const double pixels_per_unit = std::hypot(direction.x, direction.y);
+  if (!(pixels_per_unit > 1e-4)) {
+    return std::numeric_limits<double>::quiet_NaN();
+  }
+  direction *= 1.0 / pixels_per_unit;
+  // The inner edge of the arm is one frame width inward and has the opposite
+  // sign, so the window can be a whole stroke. The sign keeps that edge out.
+  // Clipping the samples to the image, rather than requiring the whole window
+  // to fit, keeps a border that sits near the frame.
+  const double stroke = pixels_per_unit * model_.frame;
+  const double radius = std::max(params_.min_search_px, params_.search_widths * stroke);
+  if (radius < 1.0) {
+    return std::numeric_limits<double>::quiet_NaN();
+  }
+  const cv::Point2d origin = image[0];
+  if (origin.x < 2 || origin.y < 2 || origin.x >= gray.cols - 2 || origin.y >= gray.rows - 2) {
+    return std::numeric_limits<double>::quiet_NaN();
+  }
+  on_screen = true;
+  auto contrast_at = [&](double t) {
+    const float inner = gray_at(gray, origin.x + (t - 1.0) * direction.x, origin.y + (t - 1.0) * direction.y);
+    const float outer = gray_at(gray, origin.x + (t + 1.0) * direction.x, origin.y + (t + 1.0) * direction.y);
+    if (inner < 0.f || outer < 0.f) {
+      return std::numeric_limits<double>::quiet_NaN();
+    }
+    return static_cast<double>(inner - outer);
+  };
+  // Nearest local peak, not the strongest. A rail or the far side of a wide
+  // arm can outscore the border that this sample belongs to.
+  double best_t = std::numeric_limits<double>::quiet_NaN();
+  double best_abs = std::numeric_limits<double>::infinity();
+  for (double t = -radius; t <= radius + 1e-9; t += 0.5) {
+    const double contrast = contrast_at(t);
+    if (!std::isfinite(contrast) || contrast < params_.min_contrast) {
+      continue;
+    }
+    const double previous = contrast_at(t - 0.5);
+    const double next = contrast_at(t + 0.5);
+    if (std::isfinite(previous) && contrast < previous) {
+      continue;
+    }
+    if (std::isfinite(next) && contrast < next) {
+      continue;
+    }
+    if (std::abs(t) < best_abs) {
+      best_abs = std::abs(t);
+      best_t = t;
+    }
+  }
+  if (!std::isfinite(best_t)) {
+    return best_t;
+  }
+  const double left = contrast_at(best_t - 0.5);
+  const double mid = contrast_at(best_t);
+  const double right = contrast_at(best_t + 0.5);
+  const double denom = left - 2.0 * mid + right;
+  if (std::isfinite(left) && std::isfinite(mid) && std::isfinite(right) && std::abs(denom) > 1e-6) {
+    const double delta = 0.5 * (left - right) / (2.0 * denom);
+    if (std::abs(delta) <= 0.5) {
+      best_t += delta;
+    }
+  }
+  return best_t;
+}
+
+MarkerDetector::EdgeFit MarkerDetector::fit_edges(const Pose& pose, const cv::Mat& gray) const {
+  EdgeFit fit;
+  int inliers = 0;
+  int side_visible[4] = {};
+  int side_found[4] = {};
+  int side_inliers[4] = {};
+  double side_lo[4];
+  double side_hi[4];
+  for (int side = 0; side < 4; ++side) {
+    side_lo[side] = std::numeric_limits<double>::infinity();
+    side_hi[side] = -std::numeric_limits<double>::infinity();
+  }
+  for (int i = 0; i < static_cast<int>(edges_.size()); ++i) {
+    bool on_screen = false;
+    const double value = edge_offset(pose, edges_[static_cast<std::size_t>(i)], gray, on_screen);
+    const int side = edges_[static_cast<std::size_t>(i)].side;
+    if (on_screen) {
+      ++fit.visible;
+      ++side_visible[side];
+    }
+    if (!std::isfinite(value)) {
+      continue;
+    }
+    fit.index.push_back(i);
+    fit.residual.push_back(value);
+    ++side_found[side];
+    const double magnitude = std::abs(value);
+    const double weight = magnitude <= params_.huber_px ? 1.0 : params_.huber_px / magnitude;
+    fit.cost += weight * value * value;
+    if (magnitude <= params_.huber_px) {
+      ++inliers;
+      ++side_inliers[side];
+      const EdgePoint& edge = edges_[static_cast<std::size_t>(i)];
+      const double coord = (side == 0 || side == 2) ? edge.p.x : edge.p.y;
+      side_lo[side] = std::min(side_lo[side], coord);
+      side_hi[side] = std::max(side_hi[side], coord);
+    }
+  }
+  const int n = static_cast<int>(fit.index.size());
+  // A known square's pose is fixed by three line correspondences. Hits piled
+  // on one side leave the scale free, and the other three corners are then
+  // an extrapolation that changes every time the visible sliver changes.
+  int observed_sides = 0;
+  int spanned_sides = 0;
+  for (int side = 0; side < 4; ++side) {
+    if (side_visible[side] < params_.min_samples || side_found[side] == 0) {
+      continue;
+    }
+    const bool covered =
+        static_cast<double>(side_found[side]) >= params_.min_edge_frac * static_cast<double>(side_visible[side]);
+    const bool agreed =
+        static_cast<double>(side_inliers[side]) >= params_.agree_frac * static_cast<double>(side_found[side]);
+    // The far corner of a line sits about one side beyond a short segment.
+    // Inliers have to span half the side or that corner is an extrapolation.
+    const bool spanned = side_hi[side] - side_lo[side] >= params_.min_side_span * model_.outer;
+    if (covered && agreed) {
+      ++observed_sides;
+      if (spanned) {
+        ++spanned_sides;
+      }
+    }
+  }
+  fit.enough = fit.visible > 0 && n >= params_.min_edge_samples &&
+               static_cast<double>(n) >= params_.min_edge_frac * static_cast<double>(fit.visible);
+  fit.locked = fit.enough && observed_sides >= 3 &&
+               static_cast<double>(inliers) >= params_.agree_frac * static_cast<double>(n);
+  fit.determined = fit.locked && spanned_sides >= 3;
+  return fit;
+}
+
+MarkerDetector::Pose MarkerDetector::refine(const Pose& pose, const cv::Mat& gray) const {
+  Pose current = pose;
+  EdgeFit best = fit_edges(current, gray);
+  if (!best.enough) {
+    return pose;
+  }
+  double lambda = 1e-2;
+  const double step_eps[6] = {1e-4, 1e-4, 1e-4, 0.05, 0.05, 0.05};
+  for (int iter = 0; iter < params_.lm_iters; ++iter) {
+    const int rows = static_cast<int>(best.index.size());
+    cv::Mat jacobian(rows, 6, CV_64F);
+    cv::Mat residual(rows, 1, CV_64F);
+    for (int r = 0; r < rows; ++r) {
+      residual.at<double>(r, 0) = best.residual[static_cast<std::size_t>(r)];
+      const double magnitude = std::abs(residual.at<double>(r, 0));
+      const double weight = magnitude <= params_.huber_px ? 1.0 : params_.huber_px / magnitude;
+      const double scale = std::sqrt(weight);
+      residual.at<double>(r, 0) *= scale;
+      const EdgePoint& edge = edges_[static_cast<std::size_t>(best.index[static_cast<std::size_t>(r)])];
+      const std::vector<cv::Point2d> axis =
+          project(current, {{edge.p.x, edge.p.y, 0}, {edge.p.x + edge.n.x, edge.p.y + edge.n.y, 0}});
+      cv::Point2d normal(1, 0);
+      if (axis.size() == 2) {
+        normal = axis[1] - axis[0];
+        const double length = std::hypot(normal.x, normal.y);
+        if (length > 1e-4) {
+          normal *= 1.0 / length;
+        }
+      }
+      // Moving the sample along the outward normal decreases the measured
+      // offset, so the pose derivative is the negative of that image motion.
+      // Differentiating the projection, not the half-pixel search.
+      auto along = [&](const Pose& trial) {
+        const std::vector<cv::Point2d> moved = project(trial, {{edge.p.x, edge.p.y, 0}});
+        if (moved.size() != 1) {
+          return std::numeric_limits<double>::quiet_NaN();
+        }
+        return normal.x * moved[0].x + normal.y * moved[0].y;
+      };
+      for (int c = 0; c < 6; ++c) {
+        Pose plus = current;
+        Pose minus = current;
+        if (c < 3) {
+          plus.r[c] += step_eps[c];
+          minus.r[c] -= step_eps[c];
+        } else {
+          plus.t[c - 3] += step_eps[c];
+          minus.t[c - 3] -= step_eps[c];
+        }
+        const double high = along(plus);
+        const double low = along(minus);
+        if (!std::isfinite(high) || !std::isfinite(low)) {
+          jacobian.at<double>(r, c) = 0;
+        } else {
+          jacobian.at<double>(r, c) = scale * (-(high - low) / (2.0 * step_eps[c]));
+        }
+      }
+    }
+    cv::Mat normal = jacobian.t() * jacobian;
+    cv::Mat right = jacobian.t() * residual;
+    for (int c = 0; c < 6; ++c) {
+      normal.at<double>(c, c) *= 1.0 + lambda;
+    }
+    cv::Mat delta;
+    if (!cv::solve(normal, right, delta, cv::DECOMP_SVD) || delta.rows != 6) {
+      lambda *= 10.0;
+      continue;
+    }
+    Pose trial = current;
+    bool finite = true;
+    for (int c = 0; c < 6; ++c) {
+      const double value = delta.at<double>(c, 0);
+      if (!std::isfinite(value)) {
+        finite = false;
+        break;
+      }
+      if (c < 3) {
+        trial.r[c] -= value;
+      } else {
+        trial.t[c - 3] -= value;
+      }
+    }
+    if (!finite || !facing(trial)) {
+      lambda *= 10.0;
+      continue;
+    }
+    const std::array<cv::Point2d, 4> before = plate(current);
+    const std::array<cv::Point2d, 4> after = plate(trial);
+    double shift = 0;
+    double side = 0;
+    for (int i = 0; i < 4; ++i) {
+      shift += cv::norm(after[static_cast<std::size_t>(i)] - before[static_cast<std::size_t>(i)]);
+      side += cv::norm(before[static_cast<std::size_t>((i + 1) % 4)] - before[static_cast<std::size_t>(i)]);
+    }
+    if (shift > 0.5 * side) {
+      lambda *= 10.0;
+      continue;
+    }
+    EdgeFit next = fit_edges(trial, gray);
+    if (next.enough && next.cost < best.cost) {
+      current = trial;
+      best = std::move(next);
+      lambda = std::max(1e-6, lambda * 0.3);
+    } else {
+      lambda *= 10.0;
+    }
+    if (lambda > 1e6) {
+      break;
+    }
+  }
+  current.valid = true;
+  return current;
+}
+
+bool MarkerDetector::cold_start(const cv::Mat& gray, Pose& out) const {
+  cv::Mat work;
+  const double scale = params_.segment_scale;
+  if (scale < 0.999) {
+    cv::resize(gray, work, cv::Size(), scale, scale, cv::INTER_AREA);
+  } else {
+    work = gray;
+  }
+  const double inv = 1.0 / scale;
+  struct Shape {
+    std::vector<cv::Point2d> poly;
+    double area = 0;
+  };
+  std::map<std::pair<int, int>, Shape> cells;
+  std::vector<int> levels = params_.levels;
+  std::sort(levels.begin(), levels.end());
+  for (const int level : levels) {
+    cv::Mat binary;
+    cv::threshold(work, binary, level, 255, cv::THRESH_BINARY);
+    std::vector<std::vector<cv::Point>> contours;
+    cv::findContours(binary, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+    for (const auto& contour : contours) {
+      if (contour.size() < 4) {
+        continue;
+      }
+      std::vector<cv::Point> approx;
+      cv::approxPolyDP(contour, approx, params_.approx_frac * cv::arcLength(contour, true), true);
+      if (approx.size() != 6) {
+        continue;
+      }
+      const double area = std::abs(cv::contourArea(approx)) * inv * inv;
+      if (area < params_.min_area) {
+        continue;
+      }
+      cv::Point2d centroid(0, 0);
+      std::vector<cv::Point2d> poly;
+      poly.reserve(6);
+      for (const cv::Point& point : approx) {
+        const cv::Point2d full(point.x * inv, point.y * inv);
+        poly.push_back(full);
+        centroid += full;
+      }
+      centroid *= 1.0 / 6.0;
+      const auto key = std::make_pair(static_cast<int>(std::floor(centroid.x / params_.dedup_px)),
+                                      static_cast<int>(std::floor(centroid.y / params_.dedup_px)));
+      const auto found = cells.find(key);
+      if (found != cells.end() && found->second.area >= area) {
+        continue;
+      }
+      cells[key] = Shape{std::move(poly), area};
+    }
+  }
+  std::vector<Shape> shapes;
+  shapes.reserve(cells.size());
+  for (auto& entry : cells) {
+    shapes.push_back(std::move(entry.second));
+  }
+  if (static_cast<int>(shapes.size()) > params_.max_polygons) {
+    std::sort(shapes.begin(), shapes.end(),
+              [](const Shape& a, const Shape& b) { return a.area < b.area; });
+    std::vector<Shape> kept;
+    const double stride = static_cast<double>(shapes.size()) / static_cast<double>(params_.max_polygons);
+    for (int i = 0; i < params_.max_polygons; ++i) {
+      kept.push_back(std::move(shapes[static_cast<std::size_t>(i * stride)]));
+    }
+    shapes = std::move(kept);
+  }
+
+  struct Hypothesis {
+    Pose pose;
+    double rms = 0;
+    double separation = 0;
+    int confirmed = 0;
+  };
+  std::vector<Hypothesis> ranked;
+  for (const Shape& shape : shapes) {
+    for (const auto& seed : model_.seeds) {
+      for (int start = 0; start < 6; ++start) {
+        for (const int direction : {1, -1}) {
+          std::vector<cv::Point2f> object2(6);
+          std::vector<cv::Point2f> image2(6);
+          std::vector<cv::Point3d> object3(6);
+          std::vector<cv::Point2d> image3(6);
+          for (int i = 0; i < 6; ++i) {
+            int k = start + direction * i;
+            k %= 6;
+            if (k < 0) {
+              k += 6;
+            }
+            object2[static_cast<std::size_t>(i)] =
+                cv::Point2f(static_cast<float>(seed[static_cast<std::size_t>(i)].x),
+                            static_cast<float>(seed[static_cast<std::size_t>(i)].y));
+            image2[static_cast<std::size_t>(i)] =
+                cv::Point2f(static_cast<float>(shape.poly[static_cast<std::size_t>(k)].x),
+                            static_cast<float>(shape.poly[static_cast<std::size_t>(k)].y));
+            object3[static_cast<std::size_t>(i)] = {seed[static_cast<std::size_t>(i)].x,
+                                                    seed[static_cast<std::size_t>(i)].y, 0};
+            image3[static_cast<std::size_t>(i)] = shape.poly[static_cast<std::size_t>(k)];
+          }
+          const cv::Mat homography = cv::findHomography(object2, image2, 0);
+          if (homography.empty()) {
             continue;
           }
-          std::vector<cv::Point2f> src;
-          std::vector<cv::Point2f> dst;
-          for (const auto& item : used) {
-            src.push_back(kLamps[item.first].at);
-            dst.push_back(item.second->centroid);
+          std::vector<cv::Point2f> predicted;
+          cv::perspectiveTransform(object2, predicted, homography);
+          double square = 0;
+          cv::Point2d centroid(0, 0);
+          for (int i = 0; i < 6; ++i) {
+            centroid += image3[static_cast<std::size_t>(i)];
           }
-          const cv::Matx33d affine = affine_fit(src, dst);
-          if (positive_det(affine)) {
-            accept(affine, 3);
+          centroid *= 1.0 / 6.0;
+          double radius = 0;
+          for (int i = 0; i < 6; ++i) {
+            const cv::Point2f delta = predicted[static_cast<std::size_t>(i)] - image2[static_cast<std::size_t>(i)];
+            square += static_cast<double>(delta.x) * delta.x + static_cast<double>(delta.y) * delta.y;
+            radius += cv::norm(image3[static_cast<std::size_t>(i)] - centroid);
+          }
+          radius /= 6.0;
+          const double rms = std::sqrt(square / 6.0);
+          if (!(radius > 1.0) || rms > params_.reproj_frac * radius) {
+            continue;
+          }
+          std::vector<cv::Mat> rvecs;
+          std::vector<cv::Mat> tvecs;
+          const int solutions =
+              cv::solvePnPGeneric(object3, image3, camera_, dist_, rvecs, tvecs, false, cv::SOLVEPNP_IPPE);
+          for (int s = 0; s < solutions; ++s) {
+            cv::Mat r64;
+            cv::Mat t64;
+            rvecs[static_cast<std::size_t>(s)].reshape(1, 3).convertTo(r64, CV_64F);
+            tvecs[static_cast<std::size_t>(s)].reshape(1, 3).convertTo(t64, CV_64F);
+            Hypothesis hypothesis;
+            hypothesis.pose.r = {r64.at<double>(0), r64.at<double>(1), r64.at<double>(2)};
+            hypothesis.pose.t = {t64.at<double>(0), t64.at<double>(1), t64.at<double>(2)};
+            hypothesis.pose.valid = true;
+            hypothesis.rms = rms;
+            if (!facing(hypothesis.pose)) {
+              continue;
+            }
+            ranked.push_back(hypothesis);
           }
         }
       }
     }
   }
-
-  for (int i = 0; i < n; ++i) {
-    for (int j = i + 1; j < n; ++j) {
-      for (int a = 0; a < 3; ++a) {
-        for (int b = 0; b < 3; ++b) {
-          if (a == b) {
-            continue;
-          }
-          const std::vector<std::pair<int, const Blob*>> used = {
-              {a, &ells[static_cast<size_t>(i)]},
-              {b, &ells[static_cast<size_t>(j)]},
-          };
-          if (!identity_ok(used)) {
-            continue;
-          }
-          const cv::Matx33d sim = similarity(kLamps[a].at, kLamps[b].at, ells[static_cast<size_t>(i)].centroid,
-                                             ells[static_cast<size_t>(j)].centroid);
-          if (positive_det(sim)) {
-            accept(sim, 2);
-          }
-        }
+  if (ranked.empty()) {
+    return false;
+  }
+  std::sort(ranked.begin(), ranked.end(),
+            [](const Hypothesis& a, const Hypothesis& b) { return a.rms < b.rms; });
+  if (ranked.size() > 30) {
+    ranked.resize(30);
+  }
+  // The contour is the bloom, so a coarse pose can put a few runs on the
+  // wrong side of a boundary. Keep a pose when turn 0 is the best reading
+  // and has real contrast. The notch has to be unique after the edge lock.
+  std::vector<Hypothesis> unique;
+  for (Hypothesis& hypothesis : ranked) {
+    const Orientation orientation = orient(hypothesis.pose, gray, false);
+    const int margin0 = orientation.confirmed[0] - orientation.contradicted[0];
+    bool best_turn = orientation.confirmed[0] >= params_.min_confirmed_runs &&
+                     orientation.separation >= params_.min_contrast;
+    for (int turn = 1; best_turn && turn < 4; ++turn) {
+      const int margin = orientation.confirmed[turn] - orientation.contradicted[turn];
+      if (margin >= margin0) {
+        best_turn = false;
       }
     }
+    if (!best_turn) {
+      continue;
+    }
+    hypothesis.separation = orientation.separation;
+    hypothesis.confirmed = orientation.confirmed[0];
+    unique.push_back(hypothesis);
   }
-
-  if (passed.empty()) {
-    for (const Blob& blob : ells) {
-      for (int lamp = 0; lamp < 3; ++lamp) {
-        std::vector<cv::Point2f> src;
-        std::vector<cv::Point2f> dst;
-        append_lamp(lamp, blob, src, dst);
-        const cv::Matx33d affine = affine_fit(src, dst);
-        if (!positive_det(affine) || !agrees_with_visible(affine, lamp, blob, ells)) {
-          continue;
-        }
-        const PieceHit hit = match_piece(affine, imaged_pitch(affine), pieces);
-        accept(affine, hit.blob != nullptr ? 2 : 1);
+  if (unique.empty()) {
+    return false;
+  }
+  std::sort(unique.begin(), unique.end(), [](const Hypothesis& a, const Hypothesis& b) {
+    if (a.confirmed != b.confirmed) {
+      return a.confirmed > b.confirmed;
+    }
+    return a.separation > b.separation;
+  });
+  if (unique.size() > 8) {
+    unique.resize(8);
+  }
+  // Two planar solutions of one L reproject that L together and the outer
+  // corners apart. Lock each survivor to the whole border, then keep a pose
+  // only when no other locked pose is a different plate.
+  std::vector<Hypothesis> locked;
+  for (const Hypothesis& hypothesis : unique) {
+    const std::array<cv::Point2d, 4> guess = plate(hypothesis.pose);
+    double guess_side = 0;
+    for (int i = 0; i < 4; ++i) {
+      guess_side += cv::norm(guess[static_cast<std::size_t>((i + 1) % 4)] - guess[static_cast<std::size_t>(i)]);
+    }
+    guess_side /= 4.0;
+    bool already = false;
+    for (const Hypothesis& kept : locked) {
+      const std::array<cv::Point2d, 4> other = plate(kept.pose);
+      double gap = 0;
+      for (int k = 0; k < 4; ++k) {
+        gap += cv::norm(other[static_cast<std::size_t>(k)] - guess[static_cast<std::size_t>(k)]);
+      }
+      if (guess_side > 1.0 && gap / 4.0 <= params_.pose_agree_frac * guess_side) {
+        already = true;
+        break;
       }
     }
+    if (already) {
+      continue;
+    }
+    Pose refined = refine(hypothesis.pose, gray);
+    Orientation orientation = orient(refined, gray, true);
+    const EdgeFit fit = fit_edges(refined, gray);
+    if (!orientation.unique() || !facing(refined) || !fit.determined) {
+      continue;
+    }
+    Hypothesis kept = hypothesis;
+    kept.pose = refined;
+    kept.separation = orientation.separation;
+    kept.confirmed = orientation.confirmed[0];
+    locked.push_back(kept);
   }
+  if (locked.empty()) {
+    return false;
+  }
+  double best_mean = std::numeric_limits<double>::infinity();
+  std::vector<double> mean_cost(locked.size(), 0);
+  for (std::size_t i = 0; i < locked.size(); ++i) {
+    const EdgeFit fit = fit_edges(locked[i].pose, gray);
+    const double mean = fit.cost / static_cast<double>(std::max<int>(1, static_cast<int>(fit.residual.size())));
+    mean_cost[i] = mean;
+    best_mean = std::min(best_mean, mean);
+  }
+  std::vector<Hypothesis> competitive;
+  for (std::size_t i = 0; i < locked.size(); ++i) {
+    if (mean_cost[i] <= params_.rival_cost_ratio * best_mean) {
+      competitive.push_back(locked[i]);
+    }
+  }
+  const std::array<cv::Point2d, 4> reference = plate(competitive.front().pose);
+  double side = 0;
+  for (int i = 0; i < 4; ++i) {
+    side += cv::norm(reference[static_cast<std::size_t>((i + 1) % 4)] - reference[static_cast<std::size_t>(i)]);
+  }
+  side /= 4.0;
+  for (std::size_t i = 1; i < competitive.size(); ++i) {
+    const std::array<cv::Point2d, 4> other = plate(competitive[i].pose);
+    double gap = 0;
+    for (int k = 0; k < 4; ++k) {
+      gap += cv::norm(other[static_cast<std::size_t>(k)] - reference[static_cast<std::size_t>(k)]);
+    }
+    if (!(side > 1.0) || gap / 4.0 > params_.pose_agree_frac * side) {
+      return false;
+    }
+  }
+  // One plate. The outer edge is already the positive contrast, so the
+  // lock with the smaller residual is the border. A larger image square is
+  // not a second ridge.
+  double best_cost = std::numeric_limits<double>::infinity();
+  bool any = false;
+  for (std::size_t i = 0; i < locked.size(); ++i) {
+    if (mean_cost[i] > params_.rival_cost_ratio * best_mean) {
+      continue;
+    }
+    if (mean_cost[i] < best_cost) {
+      best_cost = mean_cost[i];
+      out = locked[i].pose;
+      any = true;
+    }
+  }
+  if (!any) {
+    return false;
+  }
+  out.valid = true;
+  return true;
+}
 
-  if (passed.empty()) {
-    consider_gapped(hsv, parts, passed);
+Detection MarkerDetector::publish(const Pose& pose, double score) const {
+  Detection detection;
+  const std::array<cv::Point2d, 4> corners = plate(pose);
+  for (int i = 0; i < 4; ++i) {
+    const cv::Point2d& corner = corners[static_cast<std::size_t>(i)];
+    if (!std::isfinite(corner.x) || !std::isfinite(corner.y)) {
+      return {};
+    }
+    detection.corners[static_cast<std::size_t>(i)] =
+        cv::Point2f(static_cast<float>(corner.x), static_cast<float>(corner.y));
+    detection.measured[static_cast<std::size_t>(i)] = true;
   }
-  return choose_fit(passed);
+  detection.found = true;
+  detection.support = 4;
+  detection.score = static_cast<float>(score);
+  detection.notch = model_.notch_corner;
+  return detection;
+}
+
+MarkerDetector::Pose MarkerDetector::predict() const {
+  Pose pose = pose_;
+  pose.r += vel_r_;
+  pose.t += vel_t_;
+  return pose;
+}
+
+bool MarkerDetector::within_basin(const Pose& seed, const Pose& refined) const {
+  const std::array<cv::Point2d, 4> before = plate(seed);
+  const std::array<cv::Point2d, 4> after = plate(refined);
+  double side = 0;
+  double gap = 0;
+  for (int i = 0; i < 4; ++i) {
+    side += cv::norm(before[static_cast<std::size_t>((i + 1) % 4)] - before[static_cast<std::size_t>(i)]);
+    gap += cv::norm(after[static_cast<std::size_t>(i)] - before[static_cast<std::size_t>(i)]);
+  }
+  side /= 4.0;
+  gap /= 4.0;
+  if (!(side > 1.0) || !(model_.outer > 0.0)) {
+    return false;
+  }
+  // The normal search reaches one stroke (search_widths of the frame). The
+  // inner edge is the opposite sign, so a step inside this window is still
+  // the outer border. A step past the window was not this edge.
+  const double stroke = side * model_.frame / model_.outer;
+  return gap < params_.search_widths * stroke;
+}
+
+bool MarkerDetector::code_accepts(const Orientation& code, bool acquiring) const {
+  for (int turn = 1; turn < 4; ++turn) {
+    if (code.feasible[turn]) {
+      return false;
+    }
+  }
+  if (code.contradicted[0] != 0) {
+    return false;
+  }
+  // A new track has to read the notch. A track already identified keeps the
+  // border when this frame's read is only short, and drops it when the read
+  // contradicts that notch.
+  if (!acquiring && identity_) {
+    return true;
+  }
+  return code.unique();
+}
+
+void MarkerDetector::remember(const Pose& next, bool adopt_velocity) {
+  if (adopt_velocity && pose_.valid) {
+    vel_r_ = next.r - pose_.r;
+    vel_t_ = next.t - pose_.t;
+  } else {
+    vel_r_ = cv::Vec3d();
+    vel_t_ = cv::Vec3d();
+  }
+  pose_ = next;
+  pose_.valid = true;
+}
+
+void MarkerDetector::clear_track() {
+  pose_ = Pose();
+  vel_r_ = cv::Vec3d();
+  vel_t_ = cv::Vec3d();
+  identity_ = false;
+}
+
+Detection MarkerDetector::detect(const cv::Mat& bgr) {
+  if (!ready_ || bgr.empty() || bgr.depth() != CV_8U) {
+    clear_track();
+    return {};
+  }
+  cv::Mat gray;
+  if (bgr.channels() == 3) {
+    cv::cvtColor(bgr, gray, cv::COLOR_BGR2GRAY);
+  } else if (bgr.channels() == 1) {
+    gray = bgr;
+  } else {
+    clear_track();
+    return {};
+  }
+  try {
+    if (pose_.valid) {
+      const Pose seed = predict();
+      const Pose refined = refine(seed, gray);
+      const Orientation orientation = orient(refined, gray, true);
+      const EdgeFit fit = fit_edges(refined, gray);
+      const bool border = facing(refined) && fit.locked && within_basin(seed, refined);
+      if (border && code_accepts(orientation, false)) {
+        if (orientation.unique()) {
+          identity_ = true;
+        }
+        remember(refined, true);
+        return publish(refined, orientation.separation);
+      }
+      // The seed is not this marker on this frame. Forget it and read the
+      // frame on its own. The seed must not erase a reading.
+      clear_track();
+    }
+    Pose found;
+    if (!cold_start(gray, found)) {
+      return {};
+    }
+    identity_ = true;
+    remember(found, false);
+    return publish(found, orient(found, gray, true).separation);
+  } catch (const cv::Exception&) {
+    clear_track();
+    return {};
+  }
 }
 
 void draw_detection(cv::Mat& bgr, const Detection& detection) {
+  const cv::Scalar colors[4] = {{255, 196, 64}, {80, 220, 255}, {80, 80, 255}, {96, 220, 96}};
+  const char* names[4] = {"LT", "RT", "RB", "LB"};
+  const int font = cv::FONT_HERSHEY_SIMPLEX;
+  auto shade = [&](cv::Rect plate) {
+    plate &= cv::Rect(0, 0, bgr.cols, bgr.rows);
+    if (plate.empty() || bgr.channels() != 3) {
+      return;
+    }
+    cv::Mat roi = bgr(plate);
+    cv::Mat dark(roi.size(), roi.type(), cv::Scalar(16, 16, 16));
+    cv::addWeighted(roi, 0.30, dark, 0.70, 0, roi);
+    cv::rectangle(bgr, plate, {230, 230, 230}, 1, cv::LINE_AA);
+  };
+  auto text_at = [&](const std::string& text, cv::Point origin, cv::Scalar color, double scale) {
+    cv::putText(bgr, text, origin, font, scale, {0, 0, 0}, 3, cv::LINE_AA);
+    cv::putText(bgr, text, origin, font, scale, color, 1, cv::LINE_AA);
+  };
+
   if (!detection.found) {
-    cv::putText(bgr, "undetected", {24, 48}, cv::FONT_HERSHEY_SIMPLEX, 1.0, {0, 220, 255}, 2, cv::LINE_AA);
+    int baseline = 0;
+    const cv::Size size = cv::getTextSize("undetected", font, 0.7, 1, &baseline);
+    const int pad = 12;
+    const cv::Rect plate(20, 20, size.width + pad * 2, size.height + baseline + pad * 2);
+    shade(plate);
+    text_at("undetected", {plate.x + pad, plate.y + pad + size.height}, {240, 240, 240}, 0.7);
     return;
   }
-  const cv::Scalar colors[4] = {{0, 255, 255}, {255, 255, 0}, {255, 0, 255}, {0, 165, 255}};
-  const char* names[4] = {"LT", "RT", "RB", "LB"};
-  constexpr int kFont = cv::FONT_HERSHEY_SIMPLEX;
-  constexpr double kScale = 0.6;
-  constexpr int kThickness = 2;
-  constexpr float kRing = 5.f;
-  cv::Point2f center(0.f, 0.f);
-  for (const cv::Point2f& corner : detection.corners) {
-    center += corner;
-  }
-  center *= 0.25f;
+
+  const cv::Rect bounds(0, 0, bgr.cols, bgr.rows);
+  std::array<cv::Point, 4> clipped_a{};
+  std::array<cv::Point, 4> clipped_b{};
+  std::array<bool, 4> drawn{};
   for (int i = 0; i < 4; ++i) {
-    cv::Point a(cvRound(detection.corners[static_cast<size_t>(i)].x), cvRound(detection.corners[static_cast<size_t>(i)].y));
-    cv::Point b(cvRound(detection.corners[static_cast<size_t>((i + 1) % 4)].x),
-                cvRound(detection.corners[static_cast<size_t>((i + 1) % 4)].y));
-    if (cv::clipLine(cv::Rect(0, 0, bgr.cols, bgr.rows), a, b)) {
-      cv::line(bgr, a, b, {0, 220, 0}, 2, cv::LINE_AA);
+    cv::Point a(cvRound(detection.corners[static_cast<std::size_t>(i)].x),
+                cvRound(detection.corners[static_cast<std::size_t>(i)].y));
+    cv::Point b(cvRound(detection.corners[static_cast<std::size_t>((i + 1) % 4)].x),
+                cvRound(detection.corners[static_cast<std::size_t>((i + 1) % 4)].y));
+    drawn[static_cast<std::size_t>(i)] = cv::clipLine(bounds, a, b);
+    clipped_a[static_cast<std::size_t>(i)] = a;
+    clipped_b[static_cast<std::size_t>(i)] = b;
+  }
+  for (int i = 0; i < 4; ++i) {
+    if (drawn[static_cast<std::size_t>(i)]) {
+      cv::line(bgr, clipped_a[static_cast<std::size_t>(i)], clipped_b[static_cast<std::size_t>(i)], {0, 0, 0}, 5,
+               cv::LINE_AA);
     }
   }
   for (int i = 0; i < 4; ++i) {
-    const cv::Point2f corner = detection.corners[static_cast<size_t>(i)];
+    if (drawn[static_cast<std::size_t>(i)]) {
+      cv::line(bgr, clipped_a[static_cast<std::size_t>(i)], clipped_b[static_cast<std::size_t>(i)], {255, 255, 255}, 2,
+               cv::LINE_AA);
+    }
+  }
+  for (int i = 0; i < 4; ++i) {
+    const cv::Point2f corner = detection.corners[static_cast<std::size_t>(i)];
     if (corner.x < 0.f || corner.y < 0.f || corner.x >= static_cast<float>(bgr.cols) ||
         corner.y >= static_cast<float>(bgr.rows)) {
       continue;
     }
-    cv::circle(bgr, corner, cvRound(kRing), colors[i], 2, cv::LINE_AA);
-    cv::Point2f outward = corner - center;
-    const float span = static_cast<float>(cv::norm(outward));
-    if (!(span > 1.f)) {
-      continue;
+    const cv::Point center(cvRound(corner.x), cvRound(corner.y));
+    cv::circle(bgr, center, 8, {0, 0, 0}, 3, cv::LINE_AA);
+    cv::circle(bgr, center, 8, colors[i], 1, cv::LINE_AA);
+  }
+
+  // Names stay in one plate, in plate order, so they never sit on the lamp.
+  // A hollow swatch is a corner that falls outside this image.
+  const int pad = 14;
+  const int col_w = 112;
+  const int row_h = 34;
+  const int caption = 26;
+  const cv::Rect plate(20, 20, pad * 2 + col_w * 2, pad * 2 + row_h * 2 + caption);
+  shade(plate);
+  const int visual[4] = {0, 1, 3, 2};
+  for (int cell = 0; cell < 4; ++cell) {
+    const int index = visual[cell];
+    const int col = cell % 2;
+    const int row = cell / 2;
+    const int x = plate.x + pad + col * col_w;
+    const int y = plate.y + pad + row * row_h;
+    const cv::Point2f corner = detection.corners[static_cast<std::size_t>(index)];
+    const bool inside = corner.x >= 0.f && corner.y >= 0.f && corner.x < static_cast<float>(bgr.cols) &&
+                        corner.y < static_cast<float>(bgr.rows);
+    const cv::Rect swatch(x, y + (row_h - 14) / 2, 14, 14);
+    const cv::Scalar ink = inside ? colors[index] : cv::Scalar(150, 150, 150);
+    if (inside) {
+      cv::rectangle(bgr, swatch, colors[index], cv::FILLED, cv::LINE_AA);
+    } else {
+      cv::rectangle(bgr, swatch, ink, 1, cv::LINE_AA);
     }
-    outward *= 1.f / span;
     int baseline = 0;
-    const cv::Size text = cv::getTextSize(names[i], kFont, kScale, kThickness, &baseline);
-    baseline += kThickness;
-    // The inner corner of each label sits on the outward diagonal, at the same
-    // distance from its ring. The glyphs extend into the outer quadrant.
-    const cv::Point2f anchor = corner + outward * (kRing + 7.f);
-    const float origin_x = outward.x >= 0.f ? anchor.x : anchor.x - static_cast<float>(text.width);
-    const float origin_y = outward.y >= 0.f ? anchor.y + static_cast<float>(text.height) : anchor.y - static_cast<float>(baseline);
-    if (origin_x < 1.f || origin_y < static_cast<float>(text.height) || origin_x + static_cast<float>(text.width) >= static_cast<float>(bgr.cols) - 1 ||
-        origin_y + static_cast<float>(baseline) >= static_cast<float>(bgr.rows) - 1) {
-      continue;
-    }
-    cv::putText(bgr, names[i], cv::Point(cvRound(origin_x), cvRound(origin_y)), kFont, kScale, colors[i], kThickness, cv::LINE_AA);
+    const cv::Size size = cv::getTextSize(names[index], font, 0.6, 1, &baseline);
+    text_at(names[index], {swatch.x + swatch.width + 8, y + (row_h + size.height) / 2 - 1},
+            inside ? cv::Scalar(245, 245, 245) : ink, 0.6);
+  }
+  if (detection.notch >= 0 && detection.notch < 4) {
+    const std::string caption_text = std::string("notch ") + names[detection.notch];
+    text_at(caption_text, {plate.x + pad, plate.y + plate.height - pad + 2}, colors[detection.notch], 0.5);
   }
 }
